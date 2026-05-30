@@ -83,6 +83,98 @@ struct heap_tracked_call {
 static_assert(!std::is_trivially_copyable_v<heap_tracked_call>);
 static_assert(!std::is_nothrow_move_constructible_v<heap_tracked_call>);
 
+struct overloaded_static_call {
+	static inline int alive = 0;
+	static inline int moves = 0;
+	static inline int calls = 0;
+
+	int value{};
+
+	static void reset() noexcept {
+		alive = 0;
+		moves = 0;
+		calls = 0;
+	}
+
+	explicit overloaded_static_call(int value_in)
+		: value(value_in) {
+		++alive;
+	}
+
+	overloaded_static_call(const overloaded_static_call& other)
+		: value(other.value) {
+		++alive;
+	}
+
+	overloaded_static_call(overloaded_static_call&& other) noexcept(false)
+		: value(other.value) {
+		++alive;
+		++moves;
+		other.value = 0;
+	}
+
+	~overloaded_static_call() {
+		--alive;
+	}
+
+	static int operator()(int value_in) noexcept {
+		++calls;
+		return value_in + 7;
+	}
+
+	static int operator()(double) noexcept {
+		return -1;
+	}
+};
+
+static_assert(!std::is_trivially_copyable_v<overloaded_static_call>);
+static_assert(!std::is_nothrow_move_constructible_v<overloaded_static_call>);
+
+struct empty_non_static_call {
+	static inline int calls = 0;
+
+	static void reset() noexcept {
+		calls = 0;
+	}
+
+	void operator()() const noexcept {
+		++calls;
+	}
+};
+
+static_assert(std::is_empty_v<empty_non_static_call>);
+
+struct tracked_result {
+	static inline int alive = 0;
+	static inline int destroyed = 0;
+
+	int value{};
+
+	static void reset() noexcept {
+		alive = 0;
+		destroyed = 0;
+	}
+
+	explicit tracked_result(int value_in)
+		: value(value_in) {
+		++alive;
+	}
+
+	tracked_result(const tracked_result&) = delete;
+	tracked_result& operator=(const tracked_result&) = delete;
+
+	tracked_result(tracked_result&& other) noexcept
+		: value(other.value) {
+		++alive;
+		other.value = 0;
+	}
+
+	~tracked_result() {
+		--alive;
+		++destroyed;
+	}
+};
+
 std::vector<int> sequence(int first, int last) {
 	std::vector<int> values;
 	for(int value = first; value <= last; ++value) {
@@ -128,6 +220,33 @@ TEST(CallStreamCorrectnessTest, PassesArgumentsToEveryCallable) {
 	EXPECT_EQ(value, 28);
 }
 
+TEST(CallStreamCorrectnessTest, OverloadedStaticCallOperatorUsesZeroPayloadDispatch) {
+	overloaded_static_call::reset();
+	mo_yanxi::call_stream<int(int)> stream;
+
+	stream.emplace_back(overloaded_static_call{123});
+
+	EXPECT_EQ(overloaded_static_call::alive, 0);
+	EXPECT_EQ(overloaded_static_call::moves, 0);
+
+	std::vector<int> results;
+	stream.execute(5, [&](int result) { results.push_back(result); });
+
+	EXPECT_EQ(overloaded_static_call::calls, 1);
+	EXPECT_EQ(results, (std::vector<int>{12}));
+	EXPECT_EQ(overloaded_static_call::alive, 0);
+}
+
+TEST(CallStreamCorrectnessTest, EmptyNonStaticCallOperatorDoesNotUseStaticDispatch) {
+	empty_non_static_call::reset();
+	void_stream<> stream;
+
+	stream.emplace_back(empty_non_static_call{});
+	stream.execute();
+
+	EXPECT_EQ(empty_non_static_call::calls, 1);
+}
+
 TEST(CallStreamCorrectnessTest, ResultCallbackReceivesAllResultsWhenItReturnsVoid) {
 	mo_yanxi::call_stream<int(int)> stream;
 	std::vector<int> results;
@@ -156,6 +275,23 @@ TEST(CallStreamCorrectnessTest, ResultCallbackCanStopDispatch) {
 
 	EXPECT_EQ(results, (std::vector<int>{11, 12}));
 	EXPECT_EQ(stream.current_ip(), stream.size());
+}
+
+TEST(CallStreamCorrectnessTest, MoveOnlyResultsAreDestroyedAfterCallback) {
+	tracked_result::reset();
+	mo_yanxi::call_stream<tracked_result(int)> stream;
+	std::vector<int> results;
+
+	stream.emplace_back([](int value) { return tracked_result(value + 1); });
+	stream.emplace_back([](int value) { return tracked_result(value + 2); });
+
+	stream.execute(10, [&](tracked_result&& result) {
+		results.push_back(result.value);
+	});
+
+	EXPECT_EQ(results, (std::vector<int>{11, 12}));
+	EXPECT_EQ(tracked_result::alive, 0);
+	EXPECT_GE(tracked_result::destroyed, 2);
 }
 
 TEST(CallStreamCorrectnessTest, BufferReserveKeepsAllocatorCapacity) {
