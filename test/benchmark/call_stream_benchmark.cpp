@@ -1,0 +1,656 @@
+#include <benchmark/benchmark.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <utility>
+#include <vector>
+
+import mo_yanxi.call_stream;
+
+#ifndef __cpp_lib_move_only_function
+#error "call_stream benchmark requires std::move_only_function support."
+#endif
+
+namespace {
+
+constexpr std::size_t kSmallCallCount = 64;
+constexpr std::size_t kLargeCallCount = 1024;
+
+enum class workload {
+	stateless_short,
+	payload_short,
+	stateless_complex,
+	payload_complex,
+	mixed
+};
+
+struct bench_context {
+	std::uint64_t value = 0x243f6a8885a308d3ULL;
+	std::array<std::uint64_t, 8> lanes = {
+		0x13198a2e03707344ULL,
+		0xa4093822299f31d0ULL,
+		0x082efa98ec4e6c89ULL,
+		0x452821e638d01377ULL,
+		0xbe5466cf34e90c6cULL,
+		0xc0ac29b7c97c50ddULL,
+		0x3f84d5b5b5470917ULL,
+		0x9216d5d98979fb1bULL
+	};
+};
+
+alignas(64) std::uint64_t g_void_sink = 0x9e3779b97f4a7c15ULL;
+
+[[nodiscard]] constexpr std::uint64_t seed_for(std::size_t index) noexcept {
+	return 0xd1b54a32d192ed03ULL + index * 0x9e3779b97f4a7c15ULL;
+}
+
+[[nodiscard]] constexpr std::uint64_t mix(std::uint64_t value) noexcept {
+	value ^= value >> 30;
+	value *= 0xbf58476d1ce4e5b9ULL;
+	value ^= value >> 27;
+	value *= 0x94d049bb133111ebULL;
+	value ^= value >> 31;
+	return value;
+}
+
+constexpr std::array<std::uint64_t, 4> kStatelessComplexLanes = {
+	mix(0x01ULL),
+	mix(0x02ULL),
+	mix(0x03ULL),
+	mix(0x04ULL)
+};
+
+void consume_void_short(std::uint64_t value) noexcept {
+	g_void_sink += value;
+}
+
+void consume_void_complex(std::uint64_t seed, const std::array<std::uint64_t, 4>& lanes) noexcept {
+	std::uint64_t value = g_void_sink + seed;
+	for(std::uint64_t lane : lanes) {
+		value = mix(value + lane);
+	}
+	g_void_sink ^= value;
+}
+
+void consume_context_short(bench_context& context, std::uint64_t value) noexcept {
+	context.value += value;
+	context.lanes[context.value & 7U] ^= context.value;
+}
+
+void consume_context_complex(bench_context& context, std::uint64_t seed) noexcept {
+	std::uint64_t value = context.value + seed;
+	for(std::size_t i = 0; i < context.lanes.size(); ++i) {
+		value = mix(value ^ (context.lanes[i] + seed_for(i)));
+		context.lanes[i] = value;
+	}
+	context.value ^= value;
+}
+
+void consume_context_complex(bench_context& context,
+                             std::uint64_t seed,
+                             const std::array<std::uint64_t, 4>& lanes) noexcept {
+	std::uint64_t value = context.value + seed;
+	for(std::uint64_t lane : lanes) {
+		value = mix(value + lane);
+	}
+	context.value ^= value;
+	context.lanes[value & 7U] += value;
+}
+
+[[nodiscard]] std::array<std::uint64_t, 4> payload_lanes(std::uint64_t seed) noexcept {
+	return {
+		mix(seed + 0x01ULL),
+		mix(seed + 0x02ULL),
+		mix(seed + 0x03ULL),
+		mix(seed + 0x04ULL)
+	};
+}
+
+struct void0_stateless_short {
+	void operator()() const noexcept {
+		consume_void_short(1);
+	}
+};
+
+struct void0_payload_short {
+	std::uint64_t value;
+
+	explicit void0_payload_short(std::uint64_t seed) noexcept
+		: value(seed) {
+	}
+
+	void operator()() const noexcept {
+		consume_void_short(value);
+	}
+};
+
+struct void0_stateless_complex {
+	void operator()() const noexcept {
+		consume_void_complex(0x517cc1b727220a95ULL, kStatelessComplexLanes);
+	}
+};
+
+struct void0_payload_complex {
+	std::uint64_t seed;
+	std::array<std::uint64_t, 4> lanes;
+
+	explicit void0_payload_complex(std::uint64_t seed_in) noexcept
+		: seed(seed_in), lanes(payload_lanes(seed_in)) {
+	}
+
+	void operator()() const noexcept {
+		consume_void_complex(seed, lanes);
+	}
+};
+
+struct context_stateless_short {
+	void operator()(bench_context& context) const noexcept {
+		consume_context_short(context, 1);
+	}
+};
+
+struct context_payload_short {
+	std::uint64_t value;
+
+	explicit context_payload_short(std::uint64_t seed) noexcept
+		: value(seed) {
+	}
+
+	void operator()(bench_context& context) const noexcept {
+		consume_context_short(context, value);
+	}
+};
+
+struct context_stateless_complex {
+	void operator()(bench_context& context) const noexcept {
+		consume_context_complex(context, 0x94d049bb133111ebULL);
+	}
+};
+
+struct context_payload_complex {
+	std::uint64_t seed;
+	std::array<std::uint64_t, 4> lanes;
+
+	explicit context_payload_complex(std::uint64_t seed_in) noexcept
+		: seed(seed_in), lanes(payload_lanes(seed_in)) {
+	}
+
+	void operator()(bench_context& context) const noexcept {
+		consume_context_complex(context, seed, lanes);
+	}
+};
+
+struct context_arg_stateless_short {
+	void operator()(bench_context& context, std::uint64_t arg) const noexcept {
+		consume_context_short(context, arg);
+	}
+};
+
+struct context_arg_payload_short {
+	std::uint64_t value;
+
+	explicit context_arg_payload_short(std::uint64_t seed) noexcept
+		: value(seed) {
+	}
+
+	void operator()(bench_context& context, std::uint64_t arg) const noexcept {
+		consume_context_short(context, arg + value);
+	}
+};
+
+struct context_arg_stateless_complex {
+	void operator()(bench_context& context, std::uint64_t arg) const noexcept {
+		consume_context_complex(context, arg + 0x632be59bd9b4e019ULL);
+	}
+};
+
+struct context_arg_payload_complex {
+	std::uint64_t seed;
+	std::array<std::uint64_t, 4> lanes;
+
+	explicit context_arg_payload_complex(std::uint64_t seed_in) noexcept
+		: seed(seed_in), lanes(payload_lanes(seed_in)) {
+	}
+
+	void operator()(bench_context& context, std::uint64_t arg) const noexcept {
+		consume_context_complex(context, arg + seed, lanes);
+	}
+};
+
+struct result_stateless_short {
+	[[nodiscard]] std::uint64_t operator()(std::uint64_t value) const noexcept {
+		return value + 1;
+	}
+};
+
+struct result_payload_short {
+	std::uint64_t value;
+
+	explicit result_payload_short(std::uint64_t seed) noexcept
+		: value(seed) {
+	}
+
+	[[nodiscard]] std::uint64_t operator()(std::uint64_t arg) const noexcept {
+		return arg + value;
+	}
+};
+
+struct result_stateless_complex {
+	[[nodiscard]] std::uint64_t operator()(std::uint64_t value) const noexcept {
+		for(std::uint64_t lane : kStatelessComplexLanes) {
+			value = mix(value + lane);
+		}
+		return value;
+	}
+};
+
+struct result_payload_complex {
+	std::uint64_t seed;
+	std::array<std::uint64_t, 4> lanes;
+
+	explicit result_payload_complex(std::uint64_t seed_in) noexcept
+		: seed(seed_in), lanes(payload_lanes(seed_in)) {
+	}
+
+	[[nodiscard]] std::uint64_t operator()(std::uint64_t arg) const noexcept {
+		std::uint64_t value = arg + seed;
+		for(std::uint64_t lane : lanes) {
+			value = mix(value + lane);
+		}
+		return value;
+	}
+};
+
+void record_items(benchmark::State& state, std::size_t calls_per_iteration) {
+	state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(calls_per_iteration));
+}
+
+void observe_context(bench_context& context) {
+	auto* lanes = context.lanes.data();
+	benchmark::DoNotOptimize(context.value);
+	benchmark::DoNotOptimize(lanes);
+	benchmark::ClobberMemory();
+}
+
+void observe_scalar(std::uint64_t& value) {
+	benchmark::DoNotOptimize(value);
+	benchmark::ClobberMemory();
+}
+
+template <workload Workload>
+void append_void0(mo_yanxi::call_stream<void()>& calls, std::size_t index) {
+	if constexpr(Workload == workload::stateless_short) {
+		calls.emplace_back<void0_stateless_short>();
+	} else if constexpr(Workload == workload::payload_short) {
+		calls.emplace_back<void0_payload_short>(seed_for(index));
+	} else if constexpr(Workload == workload::stateless_complex) {
+		calls.emplace_back<void0_stateless_complex>();
+	} else if constexpr(Workload == workload::payload_complex) {
+		calls.emplace_back<void0_payload_complex>(seed_for(index));
+	} else {
+		switch(index & 3U) {
+		case 0: calls.emplace_back<void0_stateless_short>(); break;
+		case 1: calls.emplace_back<void0_payload_short>(seed_for(index)); break;
+		case 2: calls.emplace_back<void0_stateless_complex>(); break;
+		default: calls.emplace_back<void0_payload_complex>(seed_for(index)); break;
+		}
+	}
+}
+
+template <workload Workload>
+void append_void0(std::vector<std::move_only_function<void()>>& calls, std::size_t index) {
+	if constexpr(Workload == workload::stateless_short) {
+		calls.emplace_back(void0_stateless_short{});
+	} else if constexpr(Workload == workload::payload_short) {
+		calls.emplace_back(void0_payload_short{seed_for(index)});
+	} else if constexpr(Workload == workload::stateless_complex) {
+		calls.emplace_back(void0_stateless_complex{});
+	} else if constexpr(Workload == workload::payload_complex) {
+		calls.emplace_back(void0_payload_complex{seed_for(index)});
+	} else {
+		switch(index & 3U) {
+		case 0: calls.emplace_back(void0_stateless_short{}); break;
+		case 1: calls.emplace_back(void0_payload_short{seed_for(index)}); break;
+		case 2: calls.emplace_back(void0_stateless_complex{}); break;
+		default: calls.emplace_back(void0_payload_complex{seed_for(index)}); break;
+		}
+	}
+}
+
+template <workload Workload>
+void append_context(mo_yanxi::call_stream<void(bench_context&)>& calls, std::size_t index) {
+	if constexpr(Workload == workload::stateless_short) {
+		calls.emplace_back<context_stateless_short>();
+	} else if constexpr(Workload == workload::payload_short) {
+		calls.emplace_back<context_payload_short>(seed_for(index));
+	} else if constexpr(Workload == workload::stateless_complex) {
+		calls.emplace_back<context_stateless_complex>();
+	} else if constexpr(Workload == workload::payload_complex) {
+		calls.emplace_back<context_payload_complex>(seed_for(index));
+	} else {
+		switch(index & 3U) {
+		case 0: calls.emplace_back<context_stateless_short>(); break;
+		case 1: calls.emplace_back<context_payload_short>(seed_for(index)); break;
+		case 2: calls.emplace_back<context_stateless_complex>(); break;
+		default: calls.emplace_back<context_payload_complex>(seed_for(index)); break;
+		}
+	}
+}
+
+template <workload Workload>
+void append_context(std::vector<std::move_only_function<void(bench_context&)>>& calls, std::size_t index) {
+	if constexpr(Workload == workload::stateless_short) {
+		calls.emplace_back(context_stateless_short{});
+	} else if constexpr(Workload == workload::payload_short) {
+		calls.emplace_back(context_payload_short{seed_for(index)});
+	} else if constexpr(Workload == workload::stateless_complex) {
+		calls.emplace_back(context_stateless_complex{});
+	} else if constexpr(Workload == workload::payload_complex) {
+		calls.emplace_back(context_payload_complex{seed_for(index)});
+	} else {
+		switch(index & 3U) {
+		case 0: calls.emplace_back(context_stateless_short{}); break;
+		case 1: calls.emplace_back(context_payload_short{seed_for(index)}); break;
+		case 2: calls.emplace_back(context_stateless_complex{}); break;
+		default: calls.emplace_back(context_payload_complex{seed_for(index)}); break;
+		}
+	}
+}
+
+template <workload Workload>
+void append_context_arg(mo_yanxi::call_stream<void(bench_context&, std::uint64_t)>& calls, std::size_t index) {
+	if constexpr(Workload == workload::stateless_short) {
+		calls.emplace_back<context_arg_stateless_short>();
+	} else if constexpr(Workload == workload::payload_short) {
+		calls.emplace_back<context_arg_payload_short>(seed_for(index));
+	} else if constexpr(Workload == workload::stateless_complex) {
+		calls.emplace_back<context_arg_stateless_complex>();
+	} else if constexpr(Workload == workload::payload_complex) {
+		calls.emplace_back<context_arg_payload_complex>(seed_for(index));
+	} else {
+		switch(index & 3U) {
+		case 0: calls.emplace_back<context_arg_stateless_short>(); break;
+		case 1: calls.emplace_back<context_arg_payload_short>(seed_for(index)); break;
+		case 2: calls.emplace_back<context_arg_stateless_complex>(); break;
+		default: calls.emplace_back<context_arg_payload_complex>(seed_for(index)); break;
+		}
+	}
+}
+
+template <workload Workload>
+void append_context_arg(std::vector<std::move_only_function<void(bench_context&, std::uint64_t)>>& calls,
+                        std::size_t index) {
+	if constexpr(Workload == workload::stateless_short) {
+		calls.emplace_back(context_arg_stateless_short{});
+	} else if constexpr(Workload == workload::payload_short) {
+		calls.emplace_back(context_arg_payload_short{seed_for(index)});
+	} else if constexpr(Workload == workload::stateless_complex) {
+		calls.emplace_back(context_arg_stateless_complex{});
+	} else if constexpr(Workload == workload::payload_complex) {
+		calls.emplace_back(context_arg_payload_complex{seed_for(index)});
+	} else {
+		switch(index & 3U) {
+		case 0: calls.emplace_back(context_arg_stateless_short{}); break;
+		case 1: calls.emplace_back(context_arg_payload_short{seed_for(index)}); break;
+		case 2: calls.emplace_back(context_arg_stateless_complex{}); break;
+		default: calls.emplace_back(context_arg_payload_complex{seed_for(index)}); break;
+		}
+	}
+}
+
+template <workload Workload>
+void append_result(mo_yanxi::call_stream<std::uint64_t(std::uint64_t)>& calls, std::size_t index) {
+	if constexpr(Workload == workload::stateless_short) {
+		calls.emplace_back<result_stateless_short>();
+	} else if constexpr(Workload == workload::payload_short) {
+		calls.emplace_back<result_payload_short>(seed_for(index));
+	} else if constexpr(Workload == workload::stateless_complex) {
+		calls.emplace_back<result_stateless_complex>();
+	} else if constexpr(Workload == workload::payload_complex) {
+		calls.emplace_back<result_payload_complex>(seed_for(index));
+	} else {
+		switch(index & 3U) {
+		case 0: calls.emplace_back<result_stateless_short>(); break;
+		case 1: calls.emplace_back<result_payload_short>(seed_for(index)); break;
+		case 2: calls.emplace_back<result_stateless_complex>(); break;
+		default: calls.emplace_back<result_payload_complex>(seed_for(index)); break;
+		}
+	}
+}
+
+template <workload Workload>
+void append_result(std::vector<std::move_only_function<std::uint64_t(std::uint64_t)>>& calls, std::size_t index) {
+	if constexpr(Workload == workload::stateless_short) {
+		calls.emplace_back(result_stateless_short{});
+	} else if constexpr(Workload == workload::payload_short) {
+		calls.emplace_back(result_payload_short{seed_for(index)});
+	} else if constexpr(Workload == workload::stateless_complex) {
+		calls.emplace_back(result_stateless_complex{});
+	} else if constexpr(Workload == workload::payload_complex) {
+		calls.emplace_back(result_payload_complex{seed_for(index)});
+	} else {
+		switch(index & 3U) {
+		case 0: calls.emplace_back(result_stateless_short{}); break;
+		case 1: calls.emplace_back(result_payload_short{seed_for(index)}); break;
+		case 2: calls.emplace_back(result_stateless_complex{}); break;
+		default: calls.emplace_back(result_payload_complex{seed_for(index)}); break;
+		}
+	}
+}
+
+template <typename Calls, workload Workload, typename Append>
+Calls make_calls(std::size_t count, Append append) {
+	Calls calls;
+	if constexpr(requires(Calls& target, std::size_t n) { target.reserve(n); }) {
+		calls.reserve(count);
+	}
+
+	for(std::size_t i = 0; i < count; ++i) {
+		append(calls, i);
+	}
+	return calls;
+}
+
+template <workload Workload>
+void bm_call_stream_void0(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	auto calls = make_calls<mo_yanxi::call_stream<void()>, Workload>(
+		count,
+		[](auto& target, std::size_t index) { append_void0<Workload>(target, index); });
+
+	for(auto _ : state) {
+		(void)_;
+		calls.reset_ip();
+		calls.execute();
+		observe_scalar(g_void_sink);
+	}
+
+	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_vector_void0(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	auto calls = make_calls<std::vector<std::move_only_function<void()>>, Workload>(
+		count,
+		[](auto& target, std::size_t index) { append_void0<Workload>(target, index); });
+
+	for(auto _ : state) {
+		(void)_;
+		for(auto& call : calls) {
+			call();
+		}
+		observe_scalar(g_void_sink);
+	}
+
+	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_call_stream_context(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	auto calls = make_calls<mo_yanxi::call_stream<void(bench_context&)>, Workload>(
+		count,
+		[](auto& target, std::size_t index) { append_context<Workload>(target, index); });
+	bench_context context;
+
+	for(auto _ : state) {
+		(void)_;
+		calls.reset_ip();
+		calls.execute(context);
+		observe_context(context);
+	}
+
+	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_vector_context(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	auto calls = make_calls<std::vector<std::move_only_function<void(bench_context&)>>, Workload>(
+		count,
+		[](auto& target, std::size_t index) { append_context<Workload>(target, index); });
+	bench_context context;
+
+	for(auto _ : state) {
+		(void)_;
+		for(auto& call : calls) {
+			call(context);
+		}
+		observe_context(context);
+	}
+
+	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_call_stream_context_arg(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	auto calls = make_calls<mo_yanxi::call_stream<void(bench_context&, std::uint64_t)>, Workload>(
+		count,
+		[](auto& target, std::size_t index) { append_context_arg<Workload>(target, index); });
+	bench_context context;
+	std::uint64_t arg = 0x3c6ef372fe94f82bULL;
+
+	for(auto _ : state) {
+		(void)_;
+		calls.reset_ip();
+		calls.execute(context, arg);
+		arg = mix(arg + context.value);
+		observe_context(context);
+		observe_scalar(arg);
+	}
+
+	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_vector_context_arg(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	auto calls = make_calls<std::vector<std::move_only_function<void(bench_context&, std::uint64_t)>>, Workload>(
+		count,
+		[](auto& target, std::size_t index) { append_context_arg<Workload>(target, index); });
+	bench_context context;
+	std::uint64_t arg = 0x3c6ef372fe94f82bULL;
+
+	for(auto _ : state) {
+		(void)_;
+		for(auto& call : calls) {
+			call(context, arg);
+		}
+		arg = mix(arg + context.value);
+		observe_context(context);
+		observe_scalar(arg);
+	}
+
+	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_call_stream_result(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	auto calls = make_calls<mo_yanxi::call_stream<std::uint64_t(std::uint64_t)>, Workload>(
+		count,
+		[](auto& target, std::size_t index) { append_result<Workload>(target, index); });
+	std::uint64_t arg = 0x510e527fade682d1ULL;
+	std::uint64_t result_sink = 0;
+
+	for(auto _ : state) {
+		(void)_;
+		calls.reset_ip();
+		calls.execute(arg, [&result_sink](std::uint64_t result) noexcept {
+			result_sink += result;
+		});
+		arg = mix(arg + result_sink);
+		observe_scalar(arg);
+		observe_scalar(result_sink);
+	}
+
+	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_vector_result(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	auto calls = make_calls<std::vector<std::move_only_function<std::uint64_t(std::uint64_t)>>, Workload>(
+		count,
+		[](auto& target, std::size_t index) { append_result<Workload>(target, index); });
+	std::uint64_t arg = 0x510e527fade682d1ULL;
+	std::uint64_t result_sink = 0;
+
+	for(auto _ : state) {
+		(void)_;
+		for(auto& call : calls) {
+			result_sink += call(arg);
+		}
+		arg = mix(arg + result_sink);
+		observe_scalar(arg);
+		observe_scalar(result_sink);
+	}
+
+	record_items(state, count);
+}
+
+#define REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, LABEL, WORKLOAD_VALUE) \
+	benchmark::RegisterBenchmark( \
+		"call_stream/" SIGNATURE "/" LABEL, \
+		&bm_call_stream_##SUFFIX<workload::WORKLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount); \
+	benchmark::RegisterBenchmark( \
+		"std_vector_move_only_function/" SIGNATURE "/" LABEL, \
+		&bm_vector_##SUFFIX<workload::WORKLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount)
+
+#define REGISTER_WORKLOADS(SUFFIX, SIGNATURE) \
+	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "stateless_short", stateless_short); \
+	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "payload_short", payload_short); \
+	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "stateless_complex", stateless_complex); \
+	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "payload_complex", payload_complex); \
+	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "mixed", mixed)
+
+void register_benchmarks() {
+	REGISTER_WORKLOADS(void0, "void()");
+	REGISTER_WORKLOADS(context, "void(bench_context&)");
+	REGISTER_WORKLOADS(context_arg, "void(bench_context&,uint64_t)");
+	REGISTER_WORKLOADS(result, "uint64_t(uint64_t)");
+}
+
+#undef REGISTER_WORKLOADS
+#undef REGISTER_BENCHMARK_PAIR
+
+} // namespace
+
+int main(int argc, char** argv) {
+	register_benchmarks();
+	benchmark::Initialize(&argc, argv);
+	if(benchmark::ReportUnrecognizedArguments(argc, argv)) {
+		return 1;
+	}
+	benchmark::RunSpecifiedBenchmarks();
+	benchmark::Shutdown();
+}
