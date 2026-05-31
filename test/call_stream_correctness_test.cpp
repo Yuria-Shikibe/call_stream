@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -13,6 +14,11 @@ using byte_allocator = std::allocator<std::byte>;
 
 template <typename... Args>
 using void_stream = mo_yanxi::basic_call_stream<byte_allocator, void, Args...>;
+
+template <typename Stream>
+concept can_emit_noop = requires(Stream& stream) {
+	stream.emit_noop();
+};
 
 struct tracking_byte_allocator {
 	using value_type = std::byte;
@@ -175,6 +181,76 @@ struct tracked_result {
 	}
 };
 
+static_assert(can_emit_noop<void_stream<>>);
+static_assert(can_emit_noop<mo_yanxi::call_stream<int()>>);
+static_assert(can_emit_noop<mo_yanxi::call_stream<std::string()>>);
+static_assert(!can_emit_noop<mo_yanxi::call_stream<tracked_result()>>);
+
+struct checked_value_arg {
+	int value{};
+
+	explicit checked_value_arg(int value_in)
+		: value(value_in) {
+	}
+
+	checked_value_arg(const checked_value_arg&) = default;
+	checked_value_arg& operator=(const checked_value_arg&) = default;
+
+	checked_value_arg(checked_value_arg&& other) noexcept
+		: value(other.value) {
+		other.value = -1;
+	}
+
+	checked_value_arg& operator=(checked_value_arg&& other) noexcept {
+		value = other.value;
+		other.value = -1;
+		return *this;
+	}
+};
+
+struct alignas(64) over_aligned_call {
+	static inline int alive = 0;
+	static inline int destroyed = 0;
+
+	int value{};
+	std::vector<int>* sink{};
+
+	static void reset() noexcept {
+		alive = 0;
+		destroyed = 0;
+	}
+
+	over_aligned_call(int value_in, std::vector<int>* sink_in)
+		: value(value_in), sink(sink_in) {
+		++alive;
+	}
+
+	over_aligned_call(const over_aligned_call& other)
+		: value(other.value), sink(other.sink) {
+		++alive;
+	}
+
+	over_aligned_call(over_aligned_call&& other) noexcept
+		: value(other.value), sink(other.sink) {
+		++alive;
+		other.value = 0;
+		other.sink = nullptr;
+	}
+
+	~over_aligned_call() {
+		--alive;
+		++destroyed;
+	}
+
+	void operator()() {
+		if(sink != nullptr) {
+			sink->push_back(value);
+		}
+	}
+};
+
+static_assert(alignof(over_aligned_call) > alignof(void*));
+
 std::vector<int> sequence(int first, int last) {
 	std::vector<int> values;
 	for(int value = first; value <= last; ++value) {
@@ -220,6 +296,18 @@ TEST(CallStreamCorrectnessTest, PassesArgumentsToEveryCallable) {
 	EXPECT_EQ(value, 28);
 }
 
+TEST(CallStreamCorrectnessTest, ByValueArgumentsAreCopiedForEachCallable) {
+	mo_yanxi::call_stream<void(checked_value_arg)> stream;
+	std::vector<int> seen;
+
+	stream.emplace_back([&](checked_value_arg arg) { seen.push_back(arg.value); });
+	stream.emplace_back([&](checked_value_arg arg) { seen.push_back(arg.value); });
+
+	stream.execute(checked_value_arg{42});
+
+	EXPECT_EQ(seen, (std::vector<int>{42, 42}));
+}
+
 TEST(CallStreamCorrectnessTest, OverloadedStaticCallOperatorUsesZeroPayloadDispatch) {
 	overloaded_static_call::reset();
 	mo_yanxi::call_stream<int(int)> stream;
@@ -247,6 +335,19 @@ TEST(CallStreamCorrectnessTest, EmptyNonStaticCallOperatorDoesNotUseStaticDispat
 	EXPECT_EQ(empty_non_static_call::calls, 1);
 }
 
+TEST(CallStreamCorrectnessTest, NoopInVoidStreamSkipsToNextInstruction) {
+	void_stream<> stream;
+	std::vector<int> values;
+
+	stream.emplace_back([&] { values.push_back(1); });
+	stream.emit_noop();
+	stream.emplace_back([&] { values.push_back(2); });
+
+	stream.execute();
+
+	EXPECT_EQ(values, (std::vector<int>{1, 2}));
+}
+
 TEST(CallStreamCorrectnessTest, ResultCallbackReceivesAllResultsWhenItReturnsVoid) {
 	mo_yanxi::call_stream<int(int)> stream;
 	std::vector<int> results;
@@ -258,6 +359,33 @@ TEST(CallStreamCorrectnessTest, ResultCallbackReceivesAllResultsWhenItReturnsVoi
 	stream.execute(10, [&](int result) { results.push_back(result); });
 
 	EXPECT_EQ(results, (std::vector<int>{11, 12, 13}));
+}
+
+TEST(CallStreamCorrectnessTest, NoopInResultStreamEmitsDefaultConstructedResult) {
+	mo_yanxi::call_stream<int()> stream;
+	std::vector<int> results;
+
+	stream.emplace_back([] { return 7; });
+	stream.emit_noop();
+	stream.emplace_back([] { return 9; });
+
+	stream.execute([&](int result) { results.push_back(result); });
+
+	EXPECT_EQ(results, (std::vector<int>{7, 0, 9}));
+}
+
+TEST(CallStreamCorrectnessTest, NoopInNonScalarResultStreamConstructsResultSlot) {
+	mo_yanxi::call_stream<std::string()> stream;
+	std::vector<std::string> results;
+
+	stream.emit_noop();
+
+	stream.execute([&](std::string&& result) {
+		results.push_back(std::move(result));
+	});
+
+	ASSERT_EQ(results.size(), 1U);
+	EXPECT_TRUE(results.front().empty());
 }
 
 TEST(CallStreamCorrectnessTest, ResultCallbackCanStopDispatch) {
@@ -335,6 +463,30 @@ TEST(CallStreamCorrectnessTest, ClearDestroysHeapAllocatedCallablesExactlyOnce) 
 
 	EXPECT_EQ(heap_tracked_call::alive, 0);
 	EXPECT_EQ(heap_tracked_call::destroyed, 40);
+}
+
+TEST(CallStreamCorrectnessTest, OverAlignedCallablesUseHeapStorageAndDestroyOnce) {
+	over_aligned_call::reset();
+	std::vector<int> seen;
+
+	{
+		void_stream<> stream;
+		for(int value = 1; value <= 8; ++value) {
+			stream.emplace_back<over_aligned_call>(value, &seen);
+		}
+
+		EXPECT_EQ(over_aligned_call::alive, 8);
+
+		stream.execute();
+		EXPECT_EQ(seen, sequence(1, 8));
+
+		stream.clear();
+		EXPECT_EQ(over_aligned_call::alive, 0);
+		EXPECT_EQ(over_aligned_call::destroyed, 8);
+	}
+
+	EXPECT_EQ(over_aligned_call::alive, 0);
+	EXPECT_EQ(over_aligned_call::destroyed, 8);
 }
 
 TEST(CallStreamCorrectnessTest, MergePreservesOrderAndTransfersHeapOwnership) {
