@@ -92,6 +92,10 @@ import std;
 #define MO_YANXI_CALL_STREAM_USE_TAIL_DISPATCH 1
 #endif
 
+#ifndef MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH
+#define MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH 0
+#endif
+
 #ifndef MO_YANXI_CALL_STREAM_USE_SCALAR_RESULT_DISPATCH
 #define MO_YANXI_CALL_STREAM_USE_SCALAR_RESULT_DISPATCH MO_YANXI_CALL_STREAM_COMPILER_CLANG
 #endif
@@ -257,6 +261,11 @@ private:
 
 
 namespace mo_yanxi{
+export enum class call_stream_exception_policy{
+	resumable,
+	nothrow
+};
+
 template <typename Result, typename Ret>
 concept call_stream_return_compatible =
 	std::is_void_v<Ret> || std::convertible_to<Result, Ret>;
@@ -275,6 +284,17 @@ using call_stream_invoke_arg_t = call_stream_invoke_arg<Arg>::type;
 template <typename Ret, typename Fn, typename... Args>
 concept call_stream_invocable = std::is_invocable_r_v<Ret, Fn, call_stream_invoke_arg_t<Args>...>;
 
+template <typename Ret, typename Fn, typename... Args>
+concept call_stream_nothrow_invocable =
+	call_stream_invocable<Ret, Fn, Args...> &&
+	std::is_nothrow_invocable_r_v<Ret, Fn, call_stream_invoke_arg_t<Args>...>;
+
+template <call_stream_exception_policy ExceptionPolicy, typename Ret, typename Fn, typename... Args>
+concept call_stream_policy_invocable =
+	call_stream_invocable<Ret, Fn, Args...> &&
+	(ExceptionPolicy != call_stream_exception_policy::nothrow ||
+		call_stream_nothrow_invocable<Ret, Fn, Args...>);
+
 template <typename T, typename Ret, typename... Args>
 concept has_compatible_static_call_operator =
 	(std::is_void_v<Ret> &&
@@ -285,6 +305,13 @@ concept has_compatible_static_call_operator =
 		requires{
 			{ T::operator()(std::declval<call_stream_invoke_arg_t<Args>>()...) } -> std::convertible_to<Ret>;
 		});
+
+template <typename T, typename Ret, typename... Args>
+concept has_compatible_nothrow_static_call_operator =
+	has_compatible_static_call_operator<T, Ret, Args...> &&
+	requires{
+		requires noexcept(T::operator()(std::declval<call_stream_invoke_arg_t<Args>>()...));
+	};
 
 template <typename Arg>
 MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) forward_invoke_arg_(std::remove_reference_t<Arg>& arg) noexcept{
@@ -298,27 +325,48 @@ MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) forward_invoke_arg_(std::remove
 }
 
 
-using call_stream_link_return_type =
-#if MO_YANXI_CALL_STREAM_HAS_TAIL_DISPATCH
-void
-#else
-std::byte*
-#endif
-;
+template <bool UseTailDispatch>
+struct call_stream_link_return;
+
+template <>
+struct call_stream_link_return<true>{
+	using type = void;
+};
+
+template <>
+struct call_stream_link_return<false>{
+	using type = std::byte*;
+};
+
+template <bool UseTailDispatch>
+using call_stream_link_return_t = typename call_stream_link_return<UseTailDispatch>::type;
+
+template <bool IsNoexcept, typename RetValue>
+struct call_stream_invoker_fn;
+
+template <typename RetValue>
+struct call_stream_invoker_fn<false, RetValue>{
+	using type = RetValue(*)(std::byte* current_instr_base, const std::byte* end, void* invoke_args_ptr);
+};
+
+template <typename RetValue>
+struct call_stream_invoker_fn<true, RetValue>{
+	using type = RetValue(*)(std::byte* current_instr_base, const std::byte* end, void* invoke_args_ptr) noexcept;
+};
 
 export template <typename Fn>
 struct cmd_call;
 
 export
-template <typename Allocator, typename Ret, typename... Args>
-class basic_call_stream;
+template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
+class basic_call_stream_impl;
 
-template <typename Allocator, typename Fn>
+template <typename Allocator, typename Fn, call_stream_exception_policy ExceptionPolicy>
 struct basic_call_stream_selector;
 
-template <typename Allocator, typename Ret, typename... Args>
-struct basic_call_stream_selector<Allocator, Ret(Args...)>{
-	using type = basic_call_stream<Allocator, Ret, Args...>;
+template <typename Allocator, typename Ret, typename... Args, call_stream_exception_policy ExceptionPolicy>
+struct basic_call_stream_selector<Allocator, Ret(Args...), ExceptionPolicy>{
+	using type = basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>;
 };
 
 
@@ -518,13 +566,22 @@ struct call_stream_uses_scalar_result<Ret, true>
 template <typename Ret>
 inline constexpr bool call_stream_uses_scalar_result_v = call_stream_uses_scalar_result<Ret>::value;
 
-template <typename Ret, bool UseScalarResult = call_stream_uses_scalar_result_v<Ret>>
+template <typename Callback, typename Ret>
+inline constexpr bool call_stream_nothrow_result_callback_v = []{
+	if constexpr(std::predicate<Callback&, Ret&&>){
+		return std::is_nothrow_invocable_r_v<bool, Callback&, Ret&&>;
+	} else{
+		return std::is_nothrow_invocable_v<Callback&, Ret&&>;
+	}
+}();
+
+template <typename Ret, bool UseTailDispatch, bool UseScalarResult = call_stream_uses_scalar_result_v<Ret>>
 struct call_stream_invoker_return{
-	using type = call_stream_link_return_type;
+	using type = call_stream_link_return_t<UseTailDispatch>;
 };
 
-template <typename Ret>
-struct call_stream_invoker_return<Ret, true>{
+template <typename Ret, bool UseTailDispatch>
+struct call_stream_invoker_return<Ret, UseTailDispatch, true>{
 	using type = Ret;
 };
 
@@ -546,24 +603,36 @@ MO_YANXI_CALL_STREAM_FORCE_INLINE constexpr std::size_t align_forward(std::size_
 	return aligned;
 }
 
-template <typename Allocator, typename Ret, typename... Args>
-class basic_call_stream{
+template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
+class basic_call_stream_impl{
 public:
 	static_assert(std::is_same_v<typename std::allocator_traits<Allocator>::value_type, std::byte>,
 	              "allocator value type must be std::byte");
 	static_assert(!std::is_rvalue_reference_v<Ret>,
 	              "call_stream does not support rvalue reference return types");
+	static_assert(ExceptionPolicy == call_stream_exception_policy::resumable ||
+	              ExceptionPolicy == call_stream_exception_policy::nothrow,
+	              "unsupported call_stream exception policy");
+	static_assert(ExceptionPolicy != call_stream_exception_policy::nothrow ||
+	              std::is_void_v<Ret> || std::is_nothrow_destructible_v<Ret>,
+	              "nothrow call_stream requires a nothrow-destructible return type");
 
 	using allocator_type = Allocator;
 	using return_type = Ret;
+	static constexpr call_stream_exception_policy exception_policy = ExceptionPolicy;
+	static constexpr bool is_nothrow = ExceptionPolicy == call_stream_exception_policy::nothrow;
 	using invoke_args = std::tuple<Args...>;
 	using result_state = call_stream_result_state<Ret, invoke_args>;
-	using resource_handle_fn = void(*)(basic_call_stream& stream, void* old_base, void* new_base) noexcept;
+	using resource_handle_fn = void(*)(basic_call_stream_impl& stream, void* old_base, void* new_base) noexcept;
 
 private:
 	static constexpr bool uses_scalar_result_ = call_stream_uses_scalar_result_v<Ret>;
-	using invoke_fn_return_type = call_stream_invoker_return<Ret>::type;
-	using invoker_fn = invoke_fn_return_type(*)(std::byte* current_instr_base, const std::byte* end, void* invoke_args_ptr);
+	static constexpr bool has_tail_dispatch_ =
+		MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH &&
+		ExceptionPolicy == call_stream_exception_policy::nothrow &&
+		MO_YANXI_CALL_STREAM_HAS_TAIL_DISPATCH;
+	using invoke_fn_return_type = typename call_stream_invoker_return<Ret, has_tail_dispatch_>::type;
+	using invoker_fn = typename call_stream_invoker_fn<is_nothrow, invoke_fn_return_type>::type;
 
 	struct
 #if MO_YANXI_CALL_STREAM_COMPILER_MSVC
@@ -617,6 +686,14 @@ private:
 			});
 	}
 
+	void set_ip_to_ptr_(const std::byte* ptr) noexcept{
+		const std::byte* base = buffer_.data();
+		const std::byte* end = base + buffer_.size();
+		MO_YANXI_CALL_STREAM_ASSUME(ptr >= base);
+		MO_YANXI_CALL_STREAM_ASSUME(ptr <= end);
+		ip_ = static_cast<std::size_t>(ptr - base);
+	}
+
 
 	void ensure_header_alignment(){
 		std::size_t current_size = buffer_.size();
@@ -627,31 +704,36 @@ private:
 	}
 
 	template <typename Fn, std::size_t... Is>
-	static decltype(auto) invoke_with_args_(Fn&& fn, invoke_args& args, std::index_sequence<Is...>){
+	static decltype(auto) invoke_with_args_(Fn&& fn, invoke_args& args, std::index_sequence<Is...>)
+		noexcept(std::is_nothrow_invocable_v<Fn, call_stream_invoke_arg_t<Args>...>){
 		return std::invoke(std::forward<Fn>(fn), mo_yanxi::forward_invoke_arg_<Args>(std::get<Is>(args))...);
 	}
 
 	template <typename Fn>
-	static void invoke_payload_(Fn&& fn, void* invoke_args_ptr) requires(std::is_void_v<Ret>){
+	static void invoke_payload_(Fn&& fn, void* invoke_args_ptr)
+		noexcept(is_nothrow && call_stream_nothrow_invocable<Ret, Fn, Args...>)
+		requires(std::is_void_v<Ret>){
 		if constexpr(sizeof...(Args) == 0){
 			(void)std::invoke(std::forward<Fn>(fn));
 		} else{
 			MO_YANXI_CALL_STREAM_ASSUME(invoke_args_ptr != nullptr);
 			auto& args = *static_cast<invoke_args*>(invoke_args_ptr);
-			(void)basic_call_stream::invoke_with_args_(std::forward<Fn>(fn), args,
+			(void)basic_call_stream_impl::invoke_with_args_(std::forward<Fn>(fn), args,
 			                                                std::index_sequence_for<Args...>{});
 		}
 	}
 
 	template <typename Fn>
-	static void invoke_payload_(Fn&& fn, void* context_ptr) requires(!std::is_void_v<Ret>){
+	static void invoke_payload_(Fn&& fn, void* context_ptr)
+		noexcept(is_nothrow && call_stream_nothrow_invocable<Ret, Fn, Args...>)
+		requires(!std::is_void_v<Ret>){
 		MO_YANXI_CALL_STREAM_ASSUME(context_ptr != nullptr);
 		auto& context = *static_cast<result_state*>(context_ptr);
 		if constexpr(sizeof...(Args) == 0){
 			context.result.emplace(std::invoke(std::forward<Fn>(fn)));
 		} else{
 			context.result.emplace(
-				basic_call_stream::invoke_with_args_(
+				basic_call_stream_impl::invoke_with_args_(
 					std::forward<Fn>(fn),
 					context.args,
 					std::index_sequence_for<Args...>{}));
@@ -659,44 +741,51 @@ private:
 	}
 
 	template <typename T, std::size_t... Is>
-	static decltype(auto) invoke_static_with_args_(invoke_args& args, std::index_sequence<Is...>){
+	static decltype(auto) invoke_static_with_args_(invoke_args& args, std::index_sequence<Is...>)
+		noexcept(noexcept(T::operator()(forward_invoke_arg_<Args>(std::get<Is>(args))...))){
 		return T::operator()(forward_invoke_arg_<Args>(std::get<Is>(args))...);
 	}
 
 	template <typename T>
-	static void invoke_static_payload_(void* invoke_args_ptr) requires(std::is_void_v<Ret>){
+	static void invoke_static_payload_(void* invoke_args_ptr)
+		noexcept(is_nothrow && has_compatible_nothrow_static_call_operator<T, Ret, Args...>)
+		requires(std::is_void_v<Ret>){
 		if constexpr(sizeof...(Args) == 0){
 			(void)T::operator()();
 		} else{
 			MO_YANXI_CALL_STREAM_ASSUME(invoke_args_ptr != nullptr);
 			auto& args = *static_cast<invoke_args*>(invoke_args_ptr);
-			(void)basic_call_stream::invoke_static_with_args_<
+			(void)basic_call_stream_impl::invoke_static_with_args_<
 				T>(args, std::index_sequence_for<Args...>{});
 		}
 	}
 
 	template <typename T>
-	static void invoke_static_payload_(void* context_ptr) requires(!std::is_void_v<Ret>){
+	static void invoke_static_payload_(void* context_ptr)
+		noexcept(is_nothrow && has_compatible_nothrow_static_call_operator<T, Ret, Args...>)
+		requires(!std::is_void_v<Ret>){
 		MO_YANXI_CALL_STREAM_ASSUME(context_ptr != nullptr);
 		auto& context = *static_cast<result_state*>(context_ptr);
 		if constexpr(sizeof...(Args) == 0){
 			context.result.emplace(T::operator()());
 		} else{
 			context.result.emplace(
-				basic_call_stream::invoke_static_with_args_<T>(
+				basic_call_stream_impl::invoke_static_with_args_<T>(
 					context.args,
 				std::index_sequence_for<Args...>{}));
 		}
 	}
 
 	template <typename Fn>
-	static Ret invoke_scalar_payload_(Fn&& fn, void* context_ptr) requires(uses_scalar_result_){
+	static Ret invoke_scalar_payload_(Fn&& fn, void* context_ptr)
+		noexcept(is_nothrow && call_stream_nothrow_invocable<Ret, Fn, Args...>)
+		requires(uses_scalar_result_){
 		if constexpr(sizeof...(Args) == 0){
 			return std::invoke(std::forward<Fn>(fn));
 		} else{
 			MO_YANXI_CALL_STREAM_ASSUME(context_ptr != nullptr);
 			auto& context = *static_cast<result_state*>(context_ptr);
-			return basic_call_stream::invoke_with_args_(
+			return basic_call_stream_impl::invoke_with_args_(
 				std::forward<Fn>(fn),
 				context.args,
 				std::index_sequence_for<Args...>{});
@@ -704,72 +793,96 @@ private:
 	}
 
 	template <typename T>
-	static Ret invoke_static_scalar_payload_(void* context_ptr) requires(uses_scalar_result_){
+	static Ret invoke_static_scalar_payload_(void* context_ptr)
+		noexcept(is_nothrow && has_compatible_nothrow_static_call_operator<T, Ret, Args...>)
+		requires(uses_scalar_result_){
 		if constexpr(sizeof...(Args) == 0){
 			return T::operator()();
 		} else{
 			MO_YANXI_CALL_STREAM_ASSUME(context_ptr != nullptr);
 			auto& context = *static_cast<result_state*>(context_ptr);
-			return basic_call_stream::invoke_static_with_args_<T>(
+			return basic_call_stream_impl::invoke_static_with_args_<T>(
 				context.args,
 				std::index_sequence_for<Args...>{});
 		}
 	}
 
 	template <typename FnTy, bool AllowStaticDispatch, typename... CtorArgs>
-		requires(std::constructible_from<FnTy, CtorArgs&&...> && call_stream_invocable<Ret, FnTy&, Args...>)
+		requires(std::constructible_from<FnTy, CtorArgs&&...> &&
+			call_stream_policy_invocable<ExceptionPolicy, Ret, FnTy&, Args...>)
 	void emplace_call_(CtorArgs&&... args);
 
 	static invoke_fn_return_type finish_result_instruction_(void* context_ptr,
 	                                                        std::byte* next_ptr)
+		noexcept
 		requires(!std::is_void_v<Ret> && !uses_scalar_result_){
-#if MO_YANXI_CALL_STREAM_HAS_TAIL_DISPATCH
-		MO_YANXI_CALL_STREAM_ASSUME(context_ptr != nullptr);
-		auto& context = *static_cast<result_state*>(context_ptr);
-		context.next = next_ptr;
-#else
-		(void)context_ptr;
-		return next_ptr;
-#endif
+		if constexpr(has_tail_dispatch_){
+			MO_YANXI_CALL_STREAM_ASSUME(context_ptr != nullptr);
+			auto& context = *static_cast<result_state*>(context_ptr);
+			context.next = next_ptr;
+			return;
+		} else{
+			(void)context_ptr;
+			return next_ptr;
+		}
 	}
 
-	static void finish_scalar_result_instruction_(void* context_ptr, std::byte* next_ptr) requires(uses_scalar_result_){
+	static void finish_scalar_result_instruction_(void* context_ptr, std::byte* next_ptr) noexcept
+		requires(uses_scalar_result_){
 		MO_YANXI_CALL_STREAM_ASSUME(context_ptr != nullptr);
 		auto& context = *static_cast<result_state*>(context_ptr);
 		context.next = next_ptr;
 	}
 
 	template <typename ResultContext>
-	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute_result_context_(ResultContext& context)
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute_result_context_(ResultContext& context) noexcept(is_nothrow)
 		requires(!std::is_void_v<Ret> && !uses_scalar_result_){
 		std::byte* ptr = buffer_.data() + ip_;
 		const std::byte* end = buffer_.data() + buffer_.size();
 		if(std::greater_equal<>{}(ptr, end)) return;
 
-		try{
-			while(ptr < end){
-				auto invoker = instruction_header_(ptr)->invoker;
-				MO_YANXI_CALL_STREAM_ASSUME(invoker != nullptr);
-#if MO_YANXI_CALL_STREAM_HAS_TAIL_DISPATCH
-				context.state.next = nullptr;
-				invoker(ptr, end, std::addressof(context.state));
-				ptr = context.state.next;
-#else
-				ptr = invoker(ptr, end, std::addressof(context.state));
-#endif
-				MO_YANXI_CALL_STREAM_ASSUME(ptr != nullptr);
+		while(ptr < end){
+			auto invoker = instruction_header_(ptr)->invoker;
+			MO_YANXI_CALL_STREAM_ASSUME(invoker != nullptr);
+			if constexpr(is_nothrow){
+				if constexpr(has_tail_dispatch_){
+					context.state.next = nullptr;
+					invoker(ptr, end, std::addressof(context.state));
+					ptr = context.state.next;
+				} else{
+					ptr = invoker(ptr, end, std::addressof(context.state));
+				}
+			} else{
+				try{
+					ptr = invoker(ptr, end, std::addressof(context.state));
+				} catch(...){
+					set_ip_to_ptr_(ptr);
+					throw;
+				}
+			}
+			MO_YANXI_CALL_STREAM_ASSUME(ptr != nullptr);
+			if constexpr(!is_nothrow){
+				set_ip_to_ptr_(ptr);
+			}
 
-				assert(context.state.result.engaged());
-				if constexpr(std::predicate<decltype(*context.callback), Ret&&>){
-					bool stop = false;
+			assert(context.state.result.engaged());
+			if constexpr(std::predicate<decltype(*context.callback), Ret&&>){
+				bool stop = false;
+				if constexpr(is_nothrow){
+					stop = static_cast<bool>(std::invoke(*context.callback, context.state.result.get()));
+				} else{
 					try{
 						stop = static_cast<bool>(std::invoke(*context.callback, context.state.result.get()));
 					} catch(...){
 						context.state.result.destroy();
 						throw;
 					}
-					context.state.result.destroy();
-					if(stop) break;
+				}
+				context.state.result.destroy();
+				if(stop) break;
+			} else{
+				if constexpr(is_nothrow){
+					(void)std::invoke(*context.callback, context.state.result.get());
 				} else{
 					try{
 						(void)std::invoke(*context.callback, context.state.result.get());
@@ -777,80 +890,92 @@ private:
 						context.state.result.destroy();
 						throw;
 					}
-					context.state.result.destroy();
 				}
+				context.state.result.destroy();
 			}
-			ip_ = buffer_.size();
-		} catch(...){
-			ip_ = buffer_.size();
-			throw;
 		}
+		ip_ = buffer_.size();
 	}
 
 	template <typename ResultContext>
-	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute_scalar_result_context_(ResultContext& context) requires(uses_scalar_result_){
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute_scalar_result_context_(ResultContext& context) noexcept(is_nothrow)
+		requires(uses_scalar_result_){
 		std::byte* ptr = buffer_.data() + ip_;
 		const std::byte* end = buffer_.data() + buffer_.size();
 		if(std::greater_equal<>{}(ptr, end)) return;
 
-		try{
-			while(ptr < end){
-				auto invoker = instruction_header_(ptr)->invoker;
-				MO_YANXI_CALL_STREAM_ASSUME(invoker != nullptr);
-				context.state.next = nullptr;
-				Ret result = invoker(ptr, end, std::addressof(context.state));
-				ptr = context.state.next;
-				MO_YANXI_CALL_STREAM_ASSUME(ptr != nullptr);
+		while(ptr < end){
+			auto invoker = instruction_header_(ptr)->invoker;
+			MO_YANXI_CALL_STREAM_ASSUME(invoker != nullptr);
+			context.state.next = nullptr;
 
-				if constexpr(std::predicate<decltype(*context.callback), Ret&&>){
-					if(static_cast<bool>(std::invoke(*context.callback, std::move(result)))) break;
+			Ret result = [&]() -> Ret{
+				if constexpr(is_nothrow){
+					return invoker(ptr, end, std::addressof(context.state));
 				} else{
-					(void)std::invoke(*context.callback, std::move(result));
+					try{
+						return invoker(ptr, end, std::addressof(context.state));
+					} catch(...){
+						set_ip_to_ptr_(ptr);
+						throw;
+					}
 				}
+			}();
+			ptr = context.state.next;
+			MO_YANXI_CALL_STREAM_ASSUME(ptr != nullptr);
+			if constexpr(!is_nothrow){
+				set_ip_to_ptr_(ptr);
 			}
-			ip_ = buffer_.size();
-		} catch(...){
-			ip_ = buffer_.size();
-			throw;
+
+			if constexpr(std::predicate<decltype(*context.callback), Ret&&>){
+				if(static_cast<bool>(std::invoke(*context.callback, std::move(result)))) break;
+			} else{
+				(void)std::invoke(*context.callback, std::move(result));
+			}
 		}
+		ip_ = buffer_.size();
 	}
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute_context_(void* context_ptr){
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute_context_(void* context_ptr) noexcept(is_nothrow){
 		std::byte* ptr = buffer_.data() + ip_;
 		const std::byte* end = buffer_.data() + buffer_.size();
 		if(std::greater_equal<>{}(ptr, end)) return;
 
-		try{
-#if MO_YANXI_CALL_STREAM_HAS_TAIL_DISPATCH
-
+		if constexpr(has_tail_dispatch_){
 			auto invoker = instruction_header_(ptr)->invoker;
 			MO_YANXI_CALL_STREAM_ASSUME(invoker != nullptr);
 			invoker(ptr, end, context_ptr);
-#else
-
+			ip_ = buffer_.size();
+		} else{
 			while(ptr < end){
 				auto invoker = instruction_header_(ptr)->invoker;
 				MO_YANXI_CALL_STREAM_ASSUME(invoker != nullptr);
-				ptr = invoker(ptr, end, context_ptr);
+				if constexpr(is_nothrow){
+					ptr = invoker(ptr, end, context_ptr);
+				} else{
+					try{
+						ptr = invoker(ptr, end, context_ptr);
+					} catch(...){
+						set_ip_to_ptr_(ptr);
+						throw;
+					}
+					set_ip_to_ptr_(ptr);
+				}
 			}
-#endif
 			ip_ = buffer_.size();
-		} catch(...){
-			ip_ = buffer_.size();
-			throw;
 		}
 	}
 
 public:
-	explicit basic_call_stream(const allocator_type& alloc = allocator_type())
+	explicit basic_call_stream_impl(const allocator_type& alloc = allocator_type())
 		: buffer_(alloc),
 		  resources_(resource_allocator_type(alloc)){
 	}
 
-	basic_call_stream(const basic_call_stream&) = delete;
-	basic_call_stream& operator=(const basic_call_stream&) = delete;
+	basic_call_stream_impl(const basic_call_stream_impl&) = delete;
+	basic_call_stream_impl& operator=(const basic_call_stream_impl&) = delete;
 
-	basic_call_stream(basic_call_stream&& other) noexcept(
+	basic_call_stream_impl(basic_call_stream_impl&& other) noexcept(
 		std::is_nothrow_move_constructible_v<decltype(buffer_)> &&
 		std::is_nothrow_move_constructible_v<decltype(resources_)>)
 		: buffer_(std::move(other.buffer_)),
@@ -858,7 +983,7 @@ public:
 		  ip_(std::exchange(other.ip_, 0)){
 	}
 
-	basic_call_stream& operator=(basic_call_stream&& other) noexcept(
+	basic_call_stream_impl& operator=(basic_call_stream_impl&& other) noexcept(
 		std::is_nothrow_move_assignable_v<decltype(buffer_)> &&
 		std::is_nothrow_move_assignable_v<decltype(resources_)>){
 		if(this == &other) return *this;
@@ -869,7 +994,7 @@ public:
 		return *this;
 	}
 
-	~basic_call_stream(){
+	~basic_call_stream_impl(){
 		clear_res_();
 	}
 
@@ -962,7 +1087,7 @@ public:
 					.invoker = invoker
 				};
 
-			static constexpr auto res_handler = +[](basic_call_stream&, void* old_base, void* new_base) noexcept{
+			static constexpr auto res_handler = +[](basic_call_stream_impl&, void* old_base, void* new_base) noexcept{
 				constexpr std::size_t p_offset = align_forward(sizeof(instr_header), alignof(T));
 				auto* typed_src = std::launder(std::assume_aligned<alignof(T)>(
 					static_cast<T*>(static_cast<void*>(static_cast<std::byte*>(old_base) + p_offset))));
@@ -992,21 +1117,27 @@ public:
 		}
 	}
 
-	void emit_noop() requires(std::is_void_v<Ret> || std::default_initializable<Ret>){
+	void emit_noop()
+		requires((std::is_void_v<Ret> || std::default_initializable<Ret>) &&
+			(ExceptionPolicy != call_stream_exception_policy::nothrow ||
+				std::is_void_v<Ret> || std::is_nothrow_default_constructible_v<Ret>)){
 		this->emit_instruction(+[](std::byte* base, const std::byte* end,
-		                           void* invoke_args_ptr) static -> invoke_fn_return_type{
+		                           void* invoke_args_ptr) static noexcept(is_nothrow) -> invoke_fn_return_type{
 			std::byte* next_ptr = base + sizeof(instr_header);
 
 			if constexpr(std::is_void_v<Ret>){
-#if MO_YANXI_CALL_STREAM_HAS_TAIL_DISPATCH
-				if(next_ptr < end){
-					auto next_invoker = basic_call_stream::instruction_header_(next_ptr)->invoker;
-					MO_YANXI_CALL_STREAM_ASSUME(next_invoker != nullptr);
-					MO_YANXI_CALL_STREAM_MUST_TAIL return next_invoker(next_ptr, end, invoke_args_ptr);
+				if constexpr(has_tail_dispatch_){
+					if(next_ptr < end){
+						auto next_invoker = basic_call_stream_impl::instruction_header_(next_ptr)->invoker;
+						MO_YANXI_CALL_STREAM_ASSUME(next_invoker != nullptr);
+						MO_YANXI_CALL_STREAM_MUST_TAIL return next_invoker(next_ptr, end, invoke_args_ptr);
+					}
+					return;
+				} else{
+					(void)end;
+					(void)invoke_args_ptr;
+					return next_ptr;
 				}
-#else
-				return next_ptr;
-#endif
 			} else if constexpr(uses_scalar_result_){
 				finish_scalar_result_instruction_(invoke_args_ptr, next_ptr);
 				return Ret{};
@@ -1014,13 +1145,15 @@ public:
 				MO_YANXI_CALL_STREAM_ASSUME(invoke_args_ptr != nullptr);
 				auto& context = *static_cast<result_state*>(invoke_args_ptr);
 				context.result.emplace_default();
-				return basic_call_stream::finish_result_instruction_(invoke_args_ptr, next_ptr);
+				return basic_call_stream_impl::finish_result_instruction_(invoke_args_ptr, next_ptr);
 			}
 		}, nullptr, 0, 1);
 	}
 
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute(Args... args) requires(std::is_void_v<Ret>){
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute(Args... args)
+		noexcept(is_nothrow && std::is_nothrow_constructible_v<invoke_args, Args&&...>)
+		requires(std::is_void_v<Ret>){
 		if(empty()) return;
 
 		if constexpr(sizeof...(Args) == 0){
@@ -1032,8 +1165,14 @@ public:
 	}
 
 	template <typename Callback>
-		requires std::invocable<Callback&, Ret&&>
-	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute(Args... args, Callback&& callback) requires(!std::is_void_v<Ret>){
+		requires(std::invocable<Callback&, Ret&&> &&
+			(ExceptionPolicy != call_stream_exception_policy::nothrow ||
+				call_stream_nothrow_result_callback_v<std::remove_reference_t<Callback>, Ret>))
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute(Args... args, Callback&& callback)
+		noexcept(is_nothrow &&
+			std::is_nothrow_constructible_v<invoke_args, Args&&...> &&
+			call_stream_nothrow_result_callback_v<std::remove_reference_t<Callback>, Ret>)
+		requires(!std::is_void_v<Ret>){
 		if(empty()) return;
 
 		using CallbackT = std::remove_reference_t<Callback>;
@@ -1067,7 +1206,7 @@ public:
 		ip_ = 0;
 	}
 
-	void merge(basic_call_stream&& other){
+	void merge(basic_call_stream_impl&& other){
 		if(this == &other || other.empty()) return;
 
 		if(this->empty()){
@@ -1104,24 +1243,27 @@ public:
 	}
 
 	template <typename Fn>
-		requires(std::constructible_from<Fn, const Fn&> && call_stream_invocable<Ret, Fn&, Args...>)
+		requires(std::constructible_from<Fn, const Fn&> &&
+			call_stream_policy_invocable<ExceptionPolicy, Ret, Fn&, Args...>)
 	void push_back(const cmd_call<Fn>& call);
 
 	template <typename Fn>
-		requires(std::constructible_from<Fn, Fn&&> && call_stream_invocable<Ret, Fn&, Args...>)
+		requires(std::constructible_from<Fn, Fn&&> &&
+			call_stream_policy_invocable<ExceptionPolicy, Ret, Fn&, Args...>)
 	void push_back(cmd_call<Fn>&& call);
 
 	template <typename Fn>
 		requires(std::constructible_from<std::decay_t<Fn>, Fn&&> &&
-			call_stream_invocable<Ret, std::decay_t<Fn>&, Args...>)
+			call_stream_policy_invocable<ExceptionPolicy, Ret, std::decay_t<Fn>&, Args...>)
 	void emplace_back(Fn&& fn);
 
 	template <typename FnTy, typename... Ts>
-		requires(std::constructible_from<FnTy, Ts&&...> && call_stream_invocable<Ret, FnTy&, Args...>)
+		requires(std::constructible_from<FnTy, Ts&&...> &&
+			call_stream_policy_invocable<ExceptionPolicy, Ret, FnTy&, Args...>)
 	void emplace_back(Ts&&... args);
 
-	friend void swap(basic_call_stream& lhs,
-	                 basic_call_stream& rhs) noexcept(std::is_nothrow_swappable_v<decltype(buffer_)>){
+	friend void swap(basic_call_stream_impl& lhs,
+	                 basic_call_stream_impl& rhs) noexcept(std::is_nothrow_swappable_v<decltype(buffer_)>){
 		std::ranges::swap(lhs.buffer_, rhs.buffer_);
 		std::ranges::swap(lhs.resources_, rhs.resources_);
 		std::ranges::swap(lhs.ip_, rhs.ip_);
@@ -1129,15 +1271,17 @@ public:
 };
 
 
-#if MO_YANXI_CALL_STREAM_HAS_TAIL_DISPATCH
 #define MO_YANXI_CALL_STREAM_CMD_CALL_TAIL_DISPATCH(next, end_ptr, invoke_args_ptr) \
-	if ((next) >= (end_ptr)) return; \
-	auto* next_invoker = basic_call_stream::instruction_header_(next)->invoker; \
-	MO_YANXI_CALL_STREAM_ASSUME(next_invoker != nullptr); \
-	MO_YANXI_CALL_STREAM_MUST_TAIL return next_invoker((next), (end_ptr), (invoke_args_ptr));
-#else
-#define MO_YANXI_CALL_STREAM_CMD_CALL_TAIL_DISPATCH(next, end_ptr, invoke_args_ptr) return (next)
-#endif
+	if constexpr(has_tail_dispatch_){ \
+		if((next) >= (end_ptr)) return; \
+		auto* next_invoker = basic_call_stream_impl::instruction_header_(next)->invoker; \
+		MO_YANXI_CALL_STREAM_ASSUME(next_invoker != nullptr); \
+		MO_YANXI_CALL_STREAM_MUST_TAIL return next_invoker((next), (end_ptr), (invoke_args_ptr)); \
+	} else{ \
+		(void)(end_ptr); \
+		(void)(invoke_args_ptr); \
+		return (next); \
+	}
 
 template <typename Fn>
 struct cmd_call{
@@ -1149,15 +1293,21 @@ struct cmd_call{
 		: callable(std::forward<Args>(args)...){
 	}
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) operator()() & requires std::invocable<Fn&>{
+	MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) operator()() &
+		noexcept(std::is_nothrow_invocable_v<Fn&>)
+		requires std::invocable<Fn&>{
 		return std::invoke(this->callable);
 	}
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) operator()() && requires std::invocable<Fn>{
+	MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) operator()() &&
+		noexcept(std::is_nothrow_invocable_v<Fn>)
+		requires std::invocable<Fn>{
 		return std::invoke(std::move(this->callable));
 	}
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) operator()() const & requires std::invocable<const Fn&>{
+	MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) operator()() const &
+		noexcept(std::is_nothrow_invocable_v<const Fn&>)
+		requires std::invocable<const Fn&>{
 		return std::invoke(this->callable);
 	}
 };
@@ -1165,33 +1315,51 @@ struct cmd_call{
 template <typename Fn>
 cmd_call(Fn&&) -> cmd_call<std::decay_t<Fn>>;
 
+export template <typename Allocator, typename Ret, typename... Args>
+using basic_call_stream =
+	basic_call_stream_impl<call_stream_exception_policy::resumable, Allocator, Ret, Args...>;
+
+export template <typename Allocator, typename Ret, typename... Args>
+using basic_noexcept_call_stream =
+	basic_call_stream_impl<call_stream_exception_policy::nothrow, Allocator, Ret, Args...>;
+
+export template <
+	typename FnSign = void(),
+	typename Allocator = std::allocator<std::byte>,
+	call_stream_exception_policy ExceptionPolicy = call_stream_exception_policy::resumable>
+using call_stream = typename basic_call_stream_selector<Allocator, FnSign, ExceptionPolicy>::type;
+
 export template <typename FnSign = void(), typename Allocator = std::allocator<std::byte>>
-using call_stream = basic_call_stream_selector<Allocator, FnSign>::type;
+using noexcept_call_stream =
+	typename basic_call_stream_selector<Allocator, FnSign, call_stream_exception_policy::nothrow>::type;
 
 #pragma region StreamImpl
-template <typename Allocator, typename Ret, typename... Args>
+template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename FnTy, bool AllowStaticDispatch, typename... CtorArgs>
-	requires(std::constructible_from<FnTy, CtorArgs&&...> && call_stream_invocable<Ret, FnTy&, Args...>)
-void basic_call_stream<Allocator, Ret, Args...>::emplace_call_(CtorArgs&&... args){
+	requires(std::constructible_from<FnTy, CtorArgs&&...> &&
+		call_stream_policy_invocable<ExceptionPolicy, Ret, FnTy&, Args...>)
+void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_call_(CtorArgs&&... args){
 	using PayloadT = FnTy;
 
 
 	if constexpr(AllowStaticDispatch){
-		constexpr bool is_static = has_compatible_static_call_operator<PayloadT, Ret, Args...>;
+		constexpr bool is_static = has_compatible_static_call_operator<PayloadT, Ret, Args...> &&
+			(ExceptionPolicy != call_stream_exception_policy::nothrow ||
+				has_compatible_nothrow_static_call_operator<PayloadT, Ret, Args...>);
 		constexpr bool is_empty = std::is_empty_v<PayloadT> &&
 			std::default_initializable<PayloadT> &&
-			call_stream_invocable<Ret, const PayloadT&, Args...>;
+			call_stream_policy_invocable<ExceptionPolicy, Ret, const PayloadT&, Args...>;
 		if constexpr(!std::is_pointer_v<PayloadT> && (is_static || is_empty)){
 			this->emit_instruction(+[](std::byte* base, const std::byte* end,
-			                           void* invoke_args_ptr) static -> invoke_fn_return_type{
+			                           void* invoke_args_ptr) static noexcept(is_nothrow) -> invoke_fn_return_type{
 				std::byte* next_ptr = base + sizeof(instr_header);
 				if constexpr(uses_scalar_result_){
 					Ret result = [&]{
 						if constexpr(is_static){
-							return basic_call_stream::invoke_static_scalar_payload_<PayloadT>(invoke_args_ptr);
+							return basic_call_stream_impl::invoke_static_scalar_payload_<PayloadT>(invoke_args_ptr);
 						} else{
 							static const PayloadT fn_raw{};
-							return basic_call_stream::invoke_scalar_payload_(fn_raw, invoke_args_ptr);
+							return basic_call_stream_impl::invoke_scalar_payload_(fn_raw, invoke_args_ptr);
 						}
 					}();
 					finish_scalar_result_instruction_(invoke_args_ptr, next_ptr);
@@ -1199,17 +1367,17 @@ void basic_call_stream<Allocator, Ret, Args...>::emplace_call_(CtorArgs&&... arg
 				} else{
 					MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
 						if constexpr(is_static){
-							basic_call_stream::invoke_static_payload_<PayloadT>(invoke_args_ptr);
+							basic_call_stream_impl::invoke_static_payload_<PayloadT>(invoke_args_ptr);
 						} else{
 							static const PayloadT fn_raw{};
-							basic_call_stream::invoke_payload_(fn_raw, invoke_args_ptr);
+							basic_call_stream_impl::invoke_payload_(fn_raw, invoke_args_ptr);
 						}
 					};
 
 					if constexpr(std::is_void_v<Ret>){
 						MO_YANXI_CALL_STREAM_CMD_CALL_TAIL_DISPATCH(next_ptr, end, invoke_args_ptr);
 					} else{
-						return basic_call_stream::finish_result_instruction_(invoke_args_ptr, next_ptr);
+						return basic_call_stream_impl::finish_result_instruction_(invoke_args_ptr, next_ptr);
 					}
 				}
 			}, nullptr, 0, 1);
@@ -1224,27 +1392,37 @@ void basic_call_stream<Allocator, Ret, Args...>::emplace_call_(CtorArgs&&... arg
 
 
 	static constexpr auto fptr = +[](std::byte* base, const std::byte* end,
-	                                 void* invoke_args_ptr) static -> invoke_fn_return_type{
+	                                 void* invoke_args_ptr) static noexcept(is_nothrow) -> invoke_fn_return_type{
 		static constexpr std::size_t offset = align_forward(sizeof(instr_header), alignof(PayloadT));
 		static constexpr std::size_t total_size = align_forward(offset + sizeof(PayloadT), alignof(instr_header));
 
 		std::byte* next_ptr = base + total_size;
-		auto& obj = *std::launder(std::assume_aligned<alignof(PayloadT)>(
-			static_cast<PayloadT*>(static_cast<void*>(base + offset))));
 		if constexpr(uses_scalar_result_){
-			Ret result = basic_call_stream::invoke_scalar_payload_(obj, invoke_args_ptr);
+			auto& obj = *std::launder(std::assume_aligned<alignof(PayloadT)>(
+				static_cast<PayloadT*>(static_cast<void*>(base + offset))));
+			Ret result = basic_call_stream_impl::invoke_scalar_payload_(obj, invoke_args_ptr);
 			finish_scalar_result_instruction_(invoke_args_ptr, next_ptr);
 			return result;
-		} else{
-			MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
-				basic_call_stream::invoke_payload_(obj, invoke_args_ptr);
+		} else if constexpr(std::is_void_v<Ret>){
+			if constexpr(sizeof...(Args) == 0 && requires(PayloadT& fn){ fn(); }){
+				(*std::launder(std::assume_aligned<alignof(PayloadT)>(
+					static_cast<PayloadT*>(static_cast<void*>(base + offset)))))();
+			} else{
+				basic_call_stream_impl::invoke_payload_(
+					*std::launder(std::assume_aligned<alignof(PayloadT)>(
+						static_cast<PayloadT*>(static_cast<void*>(base + offset)))),
+					invoke_args_ptr);
 			}
 
-			if constexpr(std::is_void_v<Ret>){
-				MO_YANXI_CALL_STREAM_CMD_CALL_TAIL_DISPATCH(next_ptr, end, invoke_args_ptr);
-			} else{
-				return basic_call_stream::finish_result_instruction_(invoke_args_ptr, next_ptr);
+			MO_YANXI_CALL_STREAM_CMD_CALL_TAIL_DISPATCH(next_ptr, end, invoke_args_ptr);
+		} else{
+			auto& obj = *std::launder(std::assume_aligned<alignof(PayloadT)>(
+				static_cast<PayloadT*>(static_cast<void*>(base + offset))));
+			MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
+				basic_call_stream_impl::invoke_payload_(obj, invoke_args_ptr);
 			}
+
+			return basic_call_stream_impl::finish_result_instruction_(invoke_args_ptr, next_ptr);
 		}
 	};
 
@@ -1271,33 +1449,44 @@ void basic_call_stream<Allocator, Ret, Args...>::emplace_call_(CtorArgs&&... arg
 
 		try{
 			this->emit_non_trivial_call_heap(
-				+[](std::byte* base, const std::byte* end, void* invoke_args_ptr) static -> invoke_fn_return_type{
+				+[](std::byte* base, const std::byte* end,
+				    void* invoke_args_ptr) static noexcept(is_nothrow) -> invoke_fn_return_type{
 					static constexpr std::size_t payload_offset = align_forward(
 						sizeof(instr_header), alignof(PayloadT*));
 					static constexpr std::size_t total_size = align_forward(
 						payload_offset + sizeof(PayloadT*), alignof(instr_header));
 
 					std::byte* next_ptr = base + total_size;
-					auto& obj_ptr = *std::launder(std::assume_aligned<alignof(PayloadT*)>(
-						static_cast<PayloadT**>(static_cast<void*>(base + payload_offset))));
 					if constexpr(uses_scalar_result_){
-						Ret result = basic_call_stream::invoke_scalar_payload_(*obj_ptr, invoke_args_ptr);
+						auto& obj_ptr = *std::launder(std::assume_aligned<alignof(PayloadT*)>(
+							static_cast<PayloadT**>(static_cast<void*>(base + payload_offset))));
+						Ret result = basic_call_stream_impl::invoke_scalar_payload_(*obj_ptr, invoke_args_ptr);
 						finish_scalar_result_instruction_(invoke_args_ptr, next_ptr);
 						return result;
-					} else{
-						MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
-							basic_call_stream::invoke_payload_(*obj_ptr, invoke_args_ptr);
+					} else if constexpr(std::is_void_v<Ret>){
+						if constexpr(sizeof...(Args) == 0 && requires(PayloadT& fn){ fn(); }){
+							(**std::launder(std::assume_aligned<alignof(PayloadT*)>(
+								static_cast<PayloadT**>(static_cast<void*>(base + payload_offset)))))();
+						} else{
+							basic_call_stream_impl::invoke_payload_(
+								**std::launder(std::assume_aligned<alignof(PayloadT*)>(
+									static_cast<PayloadT**>(static_cast<void*>(base + payload_offset)))),
+								invoke_args_ptr);
 						}
 
-						if constexpr(std::is_void_v<Ret>){
-							MO_YANXI_CALL_STREAM_CMD_CALL_TAIL_DISPATCH(next_ptr, end, invoke_args_ptr);
-						} else{
-							return basic_call_stream::finish_result_instruction_(invoke_args_ptr, next_ptr);
+						MO_YANXI_CALL_STREAM_CMD_CALL_TAIL_DISPATCH(next_ptr, end, invoke_args_ptr);
+					} else{
+						auto& obj_ptr = *std::launder(std::assume_aligned<alignof(PayloadT*)>(
+							static_cast<PayloadT**>(static_cast<void*>(base + payload_offset))));
+						MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
+							basic_call_stream_impl::invoke_payload_(*obj_ptr, invoke_args_ptr);
 						}
+
+						return basic_call_stream_impl::finish_result_instruction_(invoke_args_ptr, next_ptr);
 					}
 				},
 				heap_obj,
-				+[] MO_YANXI_CALL_STREAM_FORCE_INLINE (basic_call_stream& s, void* old_base, void* new_base) noexcept{
+				+[] MO_YANXI_CALL_STREAM_FORCE_INLINE (basic_call_stream_impl& s, void* old_base, void* new_base) noexcept{
 					if(new_base) return;
 					constexpr std::size_t p_off = align_forward(
 						sizeof(instr_header), alignof(PayloadT*));
@@ -1318,52 +1507,55 @@ void basic_call_stream<Allocator, Ret, Args...>::emplace_call_(CtorArgs&&... arg
 	}
 }
 
-template <typename Allocator, typename Ret, typename... Args>
+template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename Fn>
 	requires(std::constructible_from<std::decay_t<Fn>, Fn&&> &&
-		call_stream_invocable<Ret, std::decay_t<Fn>&, Args...>)
-void basic_call_stream<Allocator, Ret, Args...>::emplace_back(Fn&& fn){
+		call_stream_policy_invocable<ExceptionPolicy, Ret, std::decay_t<Fn>&, Args...>)
+void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_back(Fn&& fn){
 	this->template emplace_call_<std::decay_t<Fn>, true>(std::forward<Fn>(fn));
 }
 
-template <typename Allocator, typename Ret, typename... Args>
+template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename FnTy, typename... Ts>
-	requires(std::constructible_from<FnTy, Ts&&...> && call_stream_invocable<Ret, FnTy&, Args...>)
-void basic_call_stream<Allocator, Ret, Args...>::emplace_back(Ts&&... args){
+	requires(std::constructible_from<FnTy, Ts&&...> &&
+		call_stream_policy_invocable<ExceptionPolicy, Ret, FnTy&, Args...>)
+void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_back(Ts&&... args){
 	this->template emplace_call_<FnTy, sizeof...(Ts) == 0>(std::forward<Ts>(args)...);
 }
 
-template <typename Allocator, typename Ret, typename... Args>
+template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename Fn>
-	requires(std::constructible_from<Fn, const Fn&> && call_stream_invocable<Ret, Fn&, Args...>)
-void basic_call_stream<Allocator, Ret, Args...>::push_back(const cmd_call<Fn>& call){
+	requires(std::constructible_from<Fn, const Fn&> &&
+		call_stream_policy_invocable<ExceptionPolicy, Ret, Fn&, Args...>)
+void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::push_back(const cmd_call<Fn>& call){
 	this->emplace_back(call.callable);
 }
 
-template <typename Allocator, typename Ret, typename... Args>
+template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename Fn>
-	requires(std::constructible_from<Fn, Fn&&> && call_stream_invocable<Ret, Fn&, Args...>)
-void basic_call_stream<Allocator, Ret, Args...>::push_back(cmd_call<Fn>&& call){
+	requires(std::constructible_from<Fn, Fn&&> &&
+		call_stream_policy_invocable<ExceptionPolicy, Ret, Fn&, Args...>)
+void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::push_back(cmd_call<Fn>&& call){
 	this->emplace_back(std::move(call.callable));
 }
 
-export template <typename Allocator, typename Ret, typename... Args, typename Fn>
+export template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args, typename Fn>
 	requires(not_cmd_call<Fn> &&
-		requires(basic_call_stream<Allocator, Ret, Args...>& stream, Fn&& call){
+		requires(basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& stream, Fn&& call){
 			stream.emplace_back(std::forward<Fn>(call));
 		})
-basic_call_stream<Allocator, Ret, Args...>& operator<<(
-	basic_call_stream<Allocator, Ret, Args...>& stream, Fn&& call){
+basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& operator<<(
+	basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& stream, Fn&& call){
 	stream.emplace_back(std::forward<Fn>(call));
 	return stream;
 }
 
-export template <typename Allocator, typename Ret, typename... Args, typename Fn>
-	requires requires(basic_call_stream<Allocator, Ret, Args...>& stream, cmd_call<Fn>&& call){
+export template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args, typename Fn>
+	requires requires(basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& stream, cmd_call<Fn>&& call){
 		stream.push_back(std::move(call));
 	}
-basic_call_stream<Allocator, Ret, Args...>& operator<<(
-	basic_call_stream<Allocator, Ret, Args...>& stream, cmd_call<Fn>&& call){
+basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& operator<<(
+	basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& stream, cmd_call<Fn>&& call){
 	stream.push_back(std::move(call));
 	return stream;
 }

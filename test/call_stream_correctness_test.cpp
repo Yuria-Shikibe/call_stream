@@ -2,8 +2,10 @@
 
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 import mo_yanxi.call_stream;
@@ -18,6 +20,26 @@ using void_stream = mo_yanxi::basic_call_stream<byte_allocator, void, Args...>;
 template <typename Stream>
 concept can_emit_noop = requires(Stream& stream) {
 	stream.emit_noop();
+};
+
+template <typename Stream, typename Fn>
+concept can_emplace_default = requires(Stream& stream) {
+	stream.template emplace_back<Fn>();
+};
+
+template <typename Stream, typename Callback>
+concept can_execute_with_callback = requires(Stream& stream, Callback callback) {
+	stream.execute(callback);
+};
+
+template <typename Stream, typename Fn>
+concept can_shift_call = requires(Stream& stream, Fn fn) {
+	stream << fn;
+};
+
+template <typename Stream, typename Fn>
+concept can_shift_cmd_call = requires(Stream& stream, mo_yanxi::cmd_call<Fn> call) {
+	stream << std::move(call);
 };
 
 struct tracking_byte_allocator {
@@ -149,6 +171,55 @@ struct empty_non_static_call {
 };
 
 static_assert(std::is_empty_v<empty_non_static_call>);
+
+struct noexcept_void_call {
+	void operator()() const noexcept {
+	}
+};
+
+struct throwing_void_call {
+	void operator()() const {
+	}
+};
+
+struct noexcept_int_call {
+	int operator()() const noexcept {
+		return 1;
+	}
+};
+
+struct throwing_int_call {
+	int operator()() const {
+		return 1;
+	}
+};
+
+struct noexcept_int_callback {
+	void operator()(int) const noexcept {
+	}
+};
+
+struct throwing_int_callback {
+	void operator()(int) const {
+	}
+};
+
+using noexcept_void_stream = mo_yanxi::noexcept_call_stream<void(), byte_allocator>;
+using noexcept_int_stream = mo_yanxi::noexcept_call_stream<int(), byte_allocator>;
+
+static_assert(can_emplace_default<noexcept_void_stream, noexcept_void_call>);
+static_assert(!can_emplace_default<noexcept_void_stream, throwing_void_call>);
+static_assert(can_emplace_default<noexcept_int_stream, noexcept_int_call>);
+static_assert(!can_emplace_default<noexcept_int_stream, throwing_int_call>);
+static_assert(can_shift_call<noexcept_void_stream, noexcept_void_call>);
+static_assert(!can_shift_call<noexcept_void_stream, throwing_void_call>);
+static_assert(can_shift_cmd_call<noexcept_void_stream, noexcept_void_call>);
+static_assert(!can_shift_cmd_call<noexcept_void_stream, throwing_void_call>);
+static_assert(can_execute_with_callback<noexcept_int_stream, noexcept_int_callback>);
+static_assert(!can_execute_with_callback<noexcept_int_stream, throwing_int_callback>);
+static_assert(noexcept(std::declval<noexcept_void_stream&>().execute()));
+static_assert(noexcept(std::declval<noexcept_int_stream&>().execute(noexcept_int_callback{})));
+static_assert(!noexcept(std::declval<mo_yanxi::call_stream<void()>&>().execute()));
 
 struct tracked_result {
 	static inline int alive = 0;
@@ -402,6 +473,140 @@ TEST(CallStreamCorrectnessTest, ResultCallbackCanStopDispatch) {
 	});
 
 	EXPECT_EQ(results, (std::vector<int>{11, 12}));
+	EXPECT_EQ(stream.current_ip(), stream.size());
+}
+
+TEST(CallStreamCorrectnessTest, ResumableVoidStreamRetriesThrowingInstruction) {
+	mo_yanxi::call_stream<void()> stream;
+	std::vector<int> seen;
+	int throws_remaining = 2;
+
+	stream.emplace_back([&] { seen.push_back(1); });
+	stream.emplace_back([&] {
+		seen.push_back(2);
+		if(throws_remaining > 0) {
+			--throws_remaining;
+			throw std::runtime_error("transient");
+		}
+	});
+	stream.emplace_back([&] { seen.push_back(3); });
+
+	EXPECT_THROW(stream.execute(), std::runtime_error);
+	EXPECT_EQ(seen, (std::vector<int>{1, 2}));
+	const std::size_t failing_ip = stream.current_ip();
+	EXPECT_GT(failing_ip, 0U);
+	EXPECT_LT(failing_ip, stream.size());
+
+	EXPECT_THROW(stream.execute(), std::runtime_error);
+	EXPECT_EQ(seen, (std::vector<int>{1, 2, 2}));
+	EXPECT_EQ(stream.current_ip(), failing_ip);
+
+	stream.execute();
+	EXPECT_EQ(seen, (std::vector<int>{1, 2, 2, 2, 3}));
+	EXPECT_EQ(stream.current_ip(), stream.size());
+}
+
+TEST(CallStreamCorrectnessTest, ResumableResultStreamRetriesThrowingInstruction) {
+	mo_yanxi::call_stream<int()> stream;
+	std::vector<int> results;
+	int throws_remaining = 2;
+
+	stream.emplace_back([] { return 1; });
+	stream.emplace_back([&] {
+		if(throws_remaining > 0) {
+			--throws_remaining;
+			throw std::runtime_error("transient");
+		}
+		return 2;
+	});
+	stream.emplace_back([] { return 3; });
+
+	EXPECT_THROW(stream.execute([&](int result) { results.push_back(result); }), std::runtime_error);
+	EXPECT_EQ(results, (std::vector<int>{1}));
+	const std::size_t failing_ip = stream.current_ip();
+	EXPECT_GT(failing_ip, 0U);
+	EXPECT_LT(failing_ip, stream.size());
+
+	EXPECT_THROW(stream.execute([&](int result) { results.push_back(result); }), std::runtime_error);
+	EXPECT_EQ(results, (std::vector<int>{1}));
+	EXPECT_EQ(stream.current_ip(), failing_ip);
+
+	stream.execute([&](int result) { results.push_back(result); });
+	EXPECT_EQ(results, (std::vector<int>{1, 2, 3}));
+	EXPECT_EQ(stream.current_ip(), stream.size());
+}
+
+TEST(CallStreamCorrectnessTest, ResumableNonScalarResultStreamRetriesThrowingInstruction) {
+	mo_yanxi::call_stream<std::string()> stream;
+	std::vector<std::string> results;
+	int throws_remaining = 2;
+
+	stream.emplace_back([] { return std::string("a"); });
+	stream.emplace_back([&] {
+		if(throws_remaining > 0) {
+			--throws_remaining;
+			throw std::runtime_error("transient");
+		}
+		return std::string("b");
+	});
+	stream.emplace_back([] { return std::string("c"); });
+
+	EXPECT_THROW(stream.execute([&](std::string&& result) { results.push_back(std::move(result)); }),
+	             std::runtime_error);
+	EXPECT_EQ(results, (std::vector<std::string>{"a"}));
+	const std::size_t failing_ip = stream.current_ip();
+	EXPECT_GT(failing_ip, 0U);
+	EXPECT_LT(failing_ip, stream.size());
+
+	EXPECT_THROW(stream.execute([&](std::string&& result) { results.push_back(std::move(result)); }),
+	             std::runtime_error);
+	EXPECT_EQ(results, (std::vector<std::string>{"a"}));
+	EXPECT_EQ(stream.current_ip(), failing_ip);
+
+	stream.execute([&](std::string&& result) { results.push_back(std::move(result)); });
+	EXPECT_EQ(results, (std::vector<std::string>{"a", "b", "c"}));
+	EXPECT_EQ(stream.current_ip(), stream.size());
+}
+
+TEST(CallStreamCorrectnessTest, ResultCallbackExceptionDestroysResultAndResumesAtNextInstruction) {
+	tracked_result::reset();
+	mo_yanxi::call_stream<tracked_result()> stream;
+	std::vector<int> results;
+	bool throw_once = true;
+
+	stream.emplace_back([] { return tracked_result(1); });
+	stream.emplace_back([] { return tracked_result(2); });
+
+	EXPECT_THROW(stream.execute([&](tracked_result&& result) {
+		             results.push_back(result.value);
+		             if(throw_once) {
+			             throw_once = false;
+			             throw std::runtime_error("callback");
+		             }
+	             }),
+	             std::runtime_error);
+	EXPECT_EQ(results, (std::vector<int>{1}));
+	EXPECT_EQ(tracked_result::alive, 0);
+	EXPECT_GT(stream.current_ip(), 0U);
+	EXPECT_LT(stream.current_ip(), stream.size());
+
+	stream.execute([&](tracked_result&& result) {
+		results.push_back(result.value);
+	});
+	EXPECT_EQ(results, (std::vector<int>{1, 2}));
+	EXPECT_EQ(tracked_result::alive, 0);
+	EXPECT_EQ(stream.current_ip(), stream.size());
+}
+
+TEST(CallStreamCorrectnessTest, NoexceptStreamExecutesNoexceptCalls) {
+	mo_yanxi::noexcept_call_stream<void()> stream;
+	int seen = 0;
+
+	stream.emplace_back([&] noexcept { seen = seen * 10 + 1; });
+	stream.emplace_back([&] noexcept { seen = seen * 10 + 2; });
+
+	stream.execute();
+	EXPECT_EQ(seen, 12);
 	EXPECT_EQ(stream.current_ip(), stream.size());
 }
 

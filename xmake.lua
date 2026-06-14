@@ -52,7 +52,7 @@ if has_config("host_project") then
 
     add_files("test/*_test.cpp")
     add_packages("gtest")
-    target_end()
+target_end()
 
     target("call_stream.benchmark")
     set_kind("binary")

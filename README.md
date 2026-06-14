@@ -9,6 +9,8 @@ It supports:
 - Inline storage for trivially copyable callables.
 - Inline or heap-backed lifetime management for non-trivial callables.
 - `reserve`, `clear`, `merge`, `reset_ip`, and early stop for result callbacks.
+- A compile-time exception policy: resumable exceptions by default, or an opt-in
+  `noexcept` stream that rejects potentially throwing callables.
 
 ## Example
 
@@ -41,6 +43,33 @@ stream.execute(10, [&](std::uint64_t result) {
     sum += result;
 });
 ```
+
+## Exception Policy
+
+`call_stream<FnSign>` uses `call_stream_exception_policy::resumable` by default.
+If a stored callable throws during `execute`, the stream keeps `current_ip()` at
+that callable. A later `execute` resumes from the same instruction instead of
+restarting from the beginning or skipping to the end.
+
+Use `noexcept_call_stream<FnSign>` or the third `call_stream` template argument
+to require nothrow execution:
+
+```cpp
+mo_yanxi::noexcept_call_stream<void()> stream;
+// Equivalent:
+mo_yanxi::call_stream<
+    void(),
+    std::allocator<std::byte>,
+    mo_yanxi::call_stream_exception_policy::nothrow> stream2;
+```
+
+In `nothrow` mode, `emplace_back`, `push_back`, and `operator<<` only accept
+callables that are `std::is_nothrow_invocable_r_v` for the stream signature.
+Return-value callbacks passed to `execute` must also be nothrow. This keeps the
+hot dispatch path free of exception recovery state. `nothrow` streams use
+noexcept invoker function pointers and compile-time dispatch branches; tail
+dispatch can be enabled with `MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH`
+on compiler/configuration combinations that accept the musttail trampoline.
 
 ## Build And Test
 
