@@ -1,4 +1,14 @@
 /_ReSharper.Caches/
 /.xmake/
 /build/
-/benchmark_results/
+/benchmark_results/*
+!/benchmark_results/gcc_linux_24cpu_force_dispatch.txt
+!/benchmark_results/gcc_linux_16cpu_force_dispatch.txt
+!/benchmark_results/gcc_force_dispatch_sources.md
+!/benchmark_results/clang_release_fastest.json
+!/benchmark_results/clang_release_fastest.txt
+!/benchmark_results/msvc_release_fastest.json
+!/benchmark_results/msvc_release_fastest.txt
+!/benchmark_results/summary.md
+!/benchmark_results/speedup_by_signature.png
+!/benchmark_results/noexcept_ratio_by_signature.png

@@ -113,64 +113,67 @@ xmake -r -y call_stream.test
 .\build\clang-cl\windows\x64\release\call_stream.test.exe
 ```
 
-The benchmark helper runs the same release/fastest configuration for clang-cl, clang, and MSVC, cleans C++ module build artifacts between targets, runs correctness tests, runs Google Benchmark, and writes a parsed Markdown summary plus a PNG bar chart:
+The benchmark helper runs the selected release/fastest toolchains, cleans C++
+module build artifacts between targets, runs correctness tests, runs Google
+Benchmark, and writes a parsed Markdown summary plus PNG charts:
 
 ```powershell
-python profiling\run_benchmarks.py --min-time 0.12 run
+python profiling\run_benchmarks.py --toolchain clang --toolchain msvc --min-time 0.12 --repetitions 7 --force-dispatch-macros run
 ```
 
-To regenerate only the Markdown summary and chart from existing JSON files:
+To regenerate only the Markdown summary and charts from existing JSON/text
+result files:
 
 ```powershell
-python profiling\run_benchmarks.py --min-time 0.12 --repetitions 3 summarize
+python profiling\run_benchmarks.py --source "GCC 24c=benchmark_results/gcc_linux_24cpu_force_dispatch.txt" --source "GCC 16c=benchmark_results/gcc_linux_16cpu_force_dispatch.txt" --toolchain clang --toolchain msvc --min-time 0.12 --repetitions 7 --force-dispatch-macros summarize
 ```
 
 ## Benchmark
 
 The benchmark compares `call_stream` against `std::vector<std::move_only_function<...>>` across 4 signatures, 5 workloads, and 64/1024 call counts. Speedup is vector CPU time divided by `call_stream` CPU time.
 
-
 ![call_stream benchmark speedup by toolchain and signature](benchmark_results/speedup_by_signature.png)
 
-Final run, 2026-05-30:
+Current forced-dispatch run, 2026-06-15:
 
-| Toolchain | Faster cases | Geomean | `void()` | `void(bench_context&)` | `void(bench_context&,uint64_t)` | `uint64_t(uint64_t)` |
+| Data source | Faster cases | Geomean | `void()` | `void(bench_context&)` | `void(bench_context&,uint64_t)` | `uint64_t(uint64_t)` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| clang-cl | 25/40 | 1.14x | 1.00x | 1.31x | 1.17x | 1.11x |
-| clang | 24/40 | 1.11x | 1.02x | 1.24x | 1.14x | 1.04x |
-| MSVC | 17/40 | 1.01x | 1.02x | 1.01x | 1.08x | 0.92x |
+| GCC 24c text | 24/40 | 1.16x | 1.45x | 0.98x | 1.26x | 0.99x |
+| GCC 16c text | 19/40 | 1.01x | 1.02x | 1.11x | 1.09x | 0.85x |
+| clang | 29/40 | 1.12x | 1.04x | 1.27x | 1.16x | 1.04x |
+| MSVC | 18/40 | 0.96x | 0.98x | 0.98x | 0.99x | 0.90x |
 
-Environment:
+Environment and inputs:
 
-- Date: 2026-05-30
-- CPU: 13th Gen Intel® Core™ i9-13900HX, 24 cores / 32 threads
-- OS: Windows 11
+- Date: 2026-06-15
+- Imported GCC raw text: [gcc_linux_24cpu_force_dispatch.txt](benchmark_results/gcc_linux_24cpu_force_dispatch.txt), [gcc_linux_16cpu_force_dispatch.txt](benchmark_results/gcc_linux_16cpu_force_dispatch.txt)
+- GCC import notes: [gcc_force_dispatch_sources.md](benchmark_results/gcc_force_dispatch_sources.md)
+- Local clang/MSVC host: Windows 11 10.0.26200, Intel64 Family 6 Model 183 Stepping 1, 32 logical CPUs
 - Google Benchmark: v1.9.5 release
-- Build: xmake release, `fastest`, `/DNDEBUG`, `/MD`, `/std:c++latest`, AVX/AVX2 enabled
+- Local build: xmake release, `fastest`, `/DNDEBUG`, `/MD`, `/std:c++latest`, AVX/AVX2 enabled
+- Local benchmark parameters: `--benchmark_min_time=0.12s`, `--benchmark_repetitions=7`, aggregate mean rows
+- Forced local dispatch macros: `MO_YANXI_CALL_STREAM_USE_TAIL_DISPATCH=1`, `MO_YANXI_CALL_STREAM_USE_SCALAR_RESULT_DISPATCH=1`
+
+`MO_YANXI_CALL_STREAM_FORCE_INLINE` is compiler-selected by the module source.
+MSVC was tested with the forced dispatch request and passed correctness plus the
+full benchmark, but the current source still keeps
+`MO_YANXI_CALL_STREAM_HAS_TAIL_DISPATCH=0` for MSVC, so this does not benchmark
+an unsafe MSVC musttail path.
+
+Detailed per-workload rows are in [benchmark_results/summary.md](benchmark_results/summary.md).
 
 ### Exception Policy Benchmark
 
 The benchmark binary also registers `call_stream_allow_exception/...` cases to compare the default resumable exception policy against the matching `noexcept` stream. Both sides use the same nothrow payload callables; the ratio is allow-exception CPU time divided by `noexcept` CPU time, so values above `1.00x` mean the `noexcept` policy is faster.
 
-Run, 2026-06-15:
+![call_stream noexcept policy ratio by toolchain and signature](benchmark_results/noexcept_ratio_by_signature.png)
 
-```powershell
-python profiling\run_benchmarks.py --toolchain clang-cl --toolchain clang --toolchain msvc --min-time 0.12 --repetitions 3 --filter "call_stream(_allow_exception)?/.*" --no-plot --no-clean run
-```
-
-| Toolchain | `noexcept` faster cases | Geomean ratio | `void()` | `void(bench_context&)` | `void(bench_context&,uint64_t)` | `uint64_t(uint64_t)` |
+| Data source | `noexcept` faster cases | Geomean ratio | `void()` | `void(bench_context&)` | `void(bench_context&,uint64_t)` | `uint64_t(uint64_t)` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| clang-cl | 33/40 | 1.32x | 1.19x | 1.60x | 1.53x | 1.05x |
-| clang | 32/40 | 1.33x | 1.19x | 1.65x | 1.52x | 1.04x |
-| MSVC | 24/40 | 1.03x | 1.02x | 1.03x | 1.05x | 1.00x |
-
-Environment:
-
-- Date: 2026-06-15
-- CPU: Intel64 Family 6 Model 183 Stepping 1, GenuineIntel, 32 logical CPUs
-- OS: Windows 11 10.0.26200
-- Google Benchmark: v1.9.5 release
-- Build: xmake release, `fastest`, `/DNDEBUG`, `/MD`, `/std:c++latest`, AVX/AVX2 enabled
+| GCC 24c text | 27/40 | 1.04x | 1.16x | 0.93x | 1.04x | 1.02x |
+| GCC 16c text | 28/40 | 1.06x | 1.03x | 1.08x | 1.10x | 1.02x |
+| clang | 35/40 | 1.21x | 1.03x | 1.48x | 1.37x | 1.03x |
+| MSVC | 23/40 | 1.10x | 0.99x | 1.05x | 0.99x | 1.42x |
 
 ## Profiling
 
@@ -186,8 +189,17 @@ Current hotspot reports are under [profiling/results](profiling/results), with t
 
 ## Performance Notes
 
-The strongest wins are short command streams with reference context arguments, especially under clang-cl where tail dispatch is active. Heavy workloads are often limited by the payload computation itself, so dispatch differences shrink.
+The strongest current local result is clang: `call_stream` wins 29/40 vector
+cases with a 1.12x geomean speedup, mainly from context-bearing signatures.
+MSVC is slightly below parity overall at 0.96x even with scalar result dispatch
+forced on; the MSVC musttail path remains guarded off for stack safety.
 
-The latest optimization pass removed per-result state writes for trivially destructible return values and bypassed `std::invoke` for ordinary directly callable objects. That moved the clang-cl `uint64_t(uint64_t)` group from a weak path to a modest win overall, while MSVC remains close to parity.
+The two imported GCC runs disagree in shape: one shows a 1.16x geomean win and
+the other is near parity at 1.01x. Treat them as separate Linux/GCC data points,
+not repeated measurements of the same host. Both raw files also warn that CPU
+scaling and ASLR were enabled.
 
-The exception-policy benchmark shows that `noexcept` mainly helps void-returning context streams on clang-cl/clang, where the geomean ratio is about `1.5x`-`1.6x` by signature. Scalar return streams are close to parity, and MSVC shows only a small overall policy difference.
+Heavy payload workloads remain close to parity because payload computation
+dominates dispatch. The `noexcept` policy still helps most clearly under clang
+for context-bearing void signatures, while MSVC's largest policy win appears in
+the scalar return signature.

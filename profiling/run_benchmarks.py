@@ -17,6 +17,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmark_results"
 CHART_PATH = RESULTS_DIR / "speedup_by_signature.png"
+POLICY_CHART_PATH = RESULTS_DIR / "noexcept_ratio_by_signature.png"
 
 DEFAULT_TOOLCHAINS = ("clang-cl", "clang", "msvc")
 TOOLCHAIN_LABELS = {
@@ -25,13 +26,21 @@ TOOLCHAIN_LABELS = {
     "msvc": "MSVC",
 }
 
+TEXT_BENCHMARK_RE = re.compile(
+    r"^(?P<name>\S+)\s+"
+    r"(?P<real>[0-9]+(?:\.[0-9]+)?)\s+(?P<real_unit>ns|us|ms|s)\s+"
+    r"(?P<cpu>[0-9]+(?:\.[0-9]+)?)\s+(?P<cpu_unit>ns|us|ms|s)\s+"
+    r"(?P<iterations>[0-9]+)\b"
+)
+
 
 def relative_path(path: Path) -> str:
-    return path.relative_to(ROOT).as_posix()
+    return path.resolve().relative_to(ROOT).as_posix()
 
 
 def run_command(command: list[str], log_path: Path | None = None) -> subprocess.CompletedProcess[str]:
-    print("+ " + subprocess.list2cmdline(command), flush=True)
+    command_line = "+ " + subprocess.list2cmdline(command)
+    print(command_line, flush=True)
     completed = subprocess.run(
         command,
         cwd=ROOT,
@@ -42,7 +51,7 @@ def run_command(command: list[str], log_path: Path | None = None) -> subprocess.
     )
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(completed.stdout, encoding="utf-8", errors="replace")
+        log_path.write_text(command_line + "\n" + completed.stdout, encoding="utf-8", errors="replace")
     if completed.stdout:
         print(completed.stdout, flush=True)
     return completed
@@ -70,27 +79,30 @@ def clean_build_dir(toolchain: str) -> None:
         shutil.rmtree(path)
 
 
-def configure(toolchain: str, clean: bool) -> None:
+def configure(toolchain: str, clean: bool, force_dispatch_macros: bool) -> None:
     if clean:
         clean_build_dir(toolchain)
+    command = [
+        "xmake",
+        "f",
+        "-c",
+        "-p",
+        "windows",
+        "-a",
+        "x64",
+        "-m",
+        "release",
+        "--host_project=y",
+        f"--toolchain={toolchain}",
+        "-o",
+        str(build_dir(toolchain)),
+        "-y",
+    ]
+    if force_dispatch_macros:
+        command.append("--force_dispatch_macros=y")
     require_ok(
         run_command(
-            [
-                "xmake",
-                "f",
-                "-c",
-                "-p",
-                "windows",
-                "-a",
-                "x64",
-                "-m",
-                "release",
-                "--host_project=y",
-                f"--toolchain={toolchain}",
-                "-o",
-                str(build_dir(toolchain)),
-                "-y",
-            ],
+            command,
             RESULTS_DIR / f"{toolchain}_configure.log",
         )
     )
@@ -149,10 +161,32 @@ def cpu_time_ns(benchmark: dict[str, Any]) -> float | None:
     return float(value) * multiplier
 
 
+def load_benchmarks(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        benchmarks = data.get("benchmarks", [])
+        return benchmarks if isinstance(benchmarks, list) else []
+
+    benchmarks: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = TEXT_BENCHMARK_RE.match(line.strip())
+        if match is None:
+            continue
+        benchmarks.append(
+            {
+                "name": match.group("name"),
+                "real_time": float(match.group("real")),
+                "cpu_time": float(match.group("cpu")),
+                "time_unit": match.group("cpu_unit"),
+                "iterations": int(match.group("iterations")),
+            }
+        )
+    return benchmarks
+
+
 def load_pairs(path: Path) -> dict[tuple[str, str, int], dict[str, float]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
     pairs: dict[tuple[str, str, int], dict[str, float]] = {}
-    for bench in data.get("benchmarks", []):
+    for bench in load_benchmarks(path):
         name = bench.get("name")
         if not isinstance(name, str):
             continue
@@ -172,9 +206,8 @@ def load_pairs(path: Path) -> dict[tuple[str, str, int], dict[str, float]]:
 
 
 def load_policy_pairs(path: Path) -> dict[tuple[str, str, int], dict[str, float]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
     pairs: dict[tuple[str, str, int], dict[str, float]] = {}
-    for bench in data.get("benchmarks", []):
+    for bench in load_benchmarks(path):
         name = bench.get("name")
         if not isinstance(name, str):
             continue
@@ -236,7 +269,7 @@ def summarize_policy(path: Path) -> dict[str, Any]:
     }
 
 
-def summarize(path: Path, toolchain: str) -> dict[str, Any]:
+def summarize(path: Path, toolchain: str, label: str | None = None) -> dict[str, Any]:
     pairs = load_pairs(path)
     rows: list[dict[str, Any]] = []
     speedups: list[float] = []
@@ -268,9 +301,9 @@ def summarize(path: Path, toolchain: str) -> dict[str, Any]:
         )
     return {
         "toolchain": toolchain,
-        "label": TOOLCHAIN_LABELS.get(toolchain, toolchain),
-        "json": relative_path(path),
-        "txt": relative_path(path.with_suffix(".txt")),
+        "label": label or TOOLCHAIN_LABELS.get(toolchain, toolchain),
+        "json": relative_path(path) if path.suffix.lower() == ".json" else None,
+        "txt": relative_path(path.with_suffix(".txt")) if path.suffix.lower() == ".json" else relative_path(path),
         "rows": rows,
         "faster": faster,
         "total": len(rows),
@@ -356,6 +389,84 @@ def plot_summaries(summaries: list[dict[str, Any]], output_path: Path = CHART_PA
     print(f"wrote {relative_path(output_path)}", flush=True)
 
 
+def plot_policy_summaries(summaries: list[dict[str, Any]], output_path: Path = POLICY_CHART_PATH) -> None:
+    summaries = [summary for summary in summaries if summary["policy"]["total"]]
+    if not summaries:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to generate benchmark charts; run `python -m pip install matplotlib`") from exc
+
+    signatures = sorted({signature for summary in summaries for signature in summary["policy"]["by_signature"]})
+    categories = ["Overall", *signatures]
+    x_positions = list(range(len(categories)))
+    width = min(0.24, 0.82 / max(1, len(summaries)))
+    colors = ["#2f6f9f", "#c7662e", "#3f8f5f", "#8a5f9e", "#5f6f8f"]
+
+    fig_width = max(10.0, 1.55 * len(categories) + 3.2)
+    fig, ax = plt.subplots(figsize=(fig_width, 5.8), dpi=160)
+
+    for index, summary in enumerate(summaries):
+        offset = (index - (len(summaries) - 1) / 2) * width
+        policy = summary["policy"]
+        values = [policy["geomean"], *[policy["by_signature"].get(signature, float("nan")) for signature in signatures]]
+        bars = ax.bar(
+            [x + offset for x in x_positions],
+            values,
+            width,
+            label=summary["label"],
+            color=colors[index % len(colors)],
+            edgecolor="#1f2933",
+            linewidth=0.5,
+        )
+        for bar, value in zip(bars, values):
+            if not math.isfinite(value):
+                continue
+            label_y = value + 0.025 if value >= 1.0 else value - 0.045
+            va = "bottom" if value >= 1.0 else "top"
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                label_y,
+                f"{value:.2f}x",
+                ha="center",
+                va=va,
+                fontsize=8,
+                color="#1f2933",
+            )
+
+    all_values = [
+        value
+        for summary in summaries
+        for value in [summary["policy"]["geomean"], *summary["policy"]["by_signature"].values()]
+        if math.isfinite(value)
+    ]
+    min_value = min(all_values, default=0.8)
+    max_value = max(all_values, default=1.2)
+    lower = max(0.0, min(0.75, min_value - 0.15))
+    upper = max(1.25, max_value + 0.2)
+
+    ax.axhline(1.0, color="#3f3f46", linewidth=1.0, linestyle="--", alpha=0.75)
+    ax.text(len(categories) - 0.55, 1.015, "1.00x parity", fontsize=8, color="#3f3f46")
+    ax.set_ylim(lower, upper)
+    ax.set_ylabel("allow-exception / noexcept CPU time (x)")
+    ax.set_title("call_stream noexcept policy ratio by toolchain and signature")
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(categories, rotation=18, ha="right")
+    ax.grid(axis="y", alpha=0.25, linewidth=0.8)
+    ax.legend(frameon=False, ncol=min(len(summaries), 4), loc="upper left")
+    ax.margins(x=0.03)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+    print(f"wrote {relative_path(output_path)}", flush=True)
+
+
 def format_ns(value: float) -> str:
     if value >= 10_000:
         return f"{value:,.0f}"
@@ -364,11 +475,40 @@ def format_ns(value: float) -> str:
     return f"{value:,.3f}"
 
 
+def parse_source_arg(source: str) -> tuple[str, Path]:
+    if "=" not in source:
+        raise ValueError(f"source must use LABEL=PATH format: {source}")
+    label, raw_path = source.split("=", 1)
+    label = label.strip()
+    if not label:
+        raise ValueError(f"source label is empty: {source}")
+    path = Path(raw_path.strip())
+    if not path.is_absolute():
+        path = ROOT / path
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return label, path
+
+
+def summarize_sources(args: argparse.Namespace) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for source in args.source:
+        label, path = parse_source_arg(source)
+        summaries.append(summarize(path, label, label))
+    return summaries
+
+
 def format_markdown(summaries: list[dict[str, Any]], args: argparse.Namespace) -> str:
     lines: list[str] = []
     lines.append("# call_stream benchmark summary")
     lines.append("")
     lines.append(f"Generated: {dt.datetime.now().isoformat(timespec='seconds')}")
+    if args.source:
+        lines.append("")
+        lines.append(
+            "Imported `--source` benchmark files are summarized alongside local runs; "
+            "their host environment is the one preserved in each raw source file."
+        )
     lines.append("")
     lines.append("## Environment")
     lines.append("")
@@ -378,6 +518,12 @@ def format_markdown(summaries: list[dict[str, Any]], args: argparse.Namespace) -
     lines.append(f"- xmake optimize: fastest")
     lines.append(f"- benchmark_min_time: {args.min_time}")
     lines.append(f"- benchmark_repetitions: {args.repetitions}")
+    if args.force_dispatch_macros:
+        lines.append(
+            "- force_dispatch_macros: yes "
+            "(`MO_YANXI_CALL_STREAM_USE_TAIL_DISPATCH=1`, "
+            "`MO_YANXI_CALL_STREAM_USE_SCALAR_RESULT_DISPATCH=1`)"
+        )
     if args.filter:
         lines.append(f"- benchmark_filter: `{args.filter}`")
     lines.append("")
@@ -390,8 +536,10 @@ def format_markdown(summaries: list[dict[str, Any]], args: argparse.Namespace) -
     for summary in summaries:
         lines.append(f"## {summary['label']}")
         lines.append("")
-        lines.append(f"- JSON: [{summary['json']}](../{summary['json']})")
-        lines.append(f"- Text: [{summary['txt']}](../{summary['txt']})")
+        if summary["json"]:
+            lines.append(f"- JSON: [{summary['json']}](../{summary['json']})")
+        if summary["txt"]:
+            lines.append(f"- Text: [{summary['txt']}](../{summary['txt']})")
         lines.append("")
         if summary["total"]:
             by_sig = ", ".join(f"`{sig}` {value:.2f}x" for sig, value in summary["by_signature"].items())
@@ -440,12 +588,12 @@ def format_markdown(summaries: list[dict[str, Any]], args: argparse.Namespace) -
 
 def command_run(args: argparse.Namespace) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    summaries = []
+    summaries = summarize_sources(args)
     for toolchain in args.toolchain:
-        configure(toolchain, args.clean)
+        configure(toolchain, args.clean, args.force_dispatch_macros)
         build("call_stream.test", toolchain)
         run_test(toolchain)
-        configure(toolchain, args.clean)
+        configure(toolchain, args.clean, args.force_dispatch_macros)
         build("call_stream.benchmark", toolchain)
         json_path = run_benchmark(toolchain, args.min_time, args.repetitions, args.filter)
         summaries.append(summarize(json_path, toolchain))
@@ -454,10 +602,11 @@ def command_run(args: argparse.Namespace) -> None:
     print(f"wrote {relative_path(summary_path)}", flush=True)
     if args.plot:
         plot_summaries(summaries)
+        plot_policy_summaries(summaries)
 
 
 def command_summarize(args: argparse.Namespace) -> None:
-    summaries = []
+    summaries = summarize_sources(args)
     for toolchain in args.toolchain:
         path = RESULTS_DIR / f"{toolchain}_release_fastest.json"
         if not path.exists():
@@ -468,16 +617,18 @@ def command_summarize(args: argparse.Namespace) -> None:
     print(f"wrote {relative_path(summary_path)}", flush=True)
     if args.plot:
         plot_summaries(summaries)
+        plot_policy_summaries(summaries)
 
 
 def command_plot(args: argparse.Namespace) -> None:
-    summaries = []
+    summaries = summarize_sources(args)
     for toolchain in args.toolchain:
         path = RESULTS_DIR / f"{toolchain}_release_fastest.json"
         if not path.exists():
             raise FileNotFoundError(path)
         summaries.append(summarize(path, toolchain))
     plot_summaries(summaries)
+    plot_policy_summaries(summaries)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -492,6 +643,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-time", type=float, default=0.08, help="Google Benchmark minimum time per benchmark.")
     parser.add_argument("--repetitions", type=int, default=1, help="Google Benchmark repetitions.")
     parser.add_argument("--filter", help="Optional Google Benchmark filter.")
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help="Additional benchmark JSON or Google Benchmark text output to include in summaries and plots.",
+    )
+    parser.add_argument(
+        "--force-dispatch-macros",
+        action="store_true",
+        help="Configure xmake with MO_YANXI_CALL_STREAM_USE_TAIL_DISPATCH=1 and "
+        "MO_YANXI_CALL_STREAM_USE_SCALAR_RESULT_DISPATCH=1.",
+    )
     parser.add_argument("--no-plot", action="store_false", dest="plot", help="Skip PNG chart generation.")
     parser.add_argument(
         "--no-clean",

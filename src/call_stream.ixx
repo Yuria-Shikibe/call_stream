@@ -118,46 +118,106 @@ import std;
 
 
 namespace mo_yanxi{
-export template <typename Allocator = std::allocator<std::byte>>
+template <std::size_t Alignment>
+struct alignas(Alignment) call_stream_buffer_storage_unit{
+	static_assert(Alignment > 0);
+	static_assert(std::has_single_bit(Alignment));
+
+	std::byte bytes[Alignment];
+};
+
+export template <typename Allocator = std::allocator<std::byte>,
+                 std::size_t BufferAlignment = alignof(std::max_align_t)>
 class call_stream_buffer{
 public:
 	using allocator_type = Allocator;
+	using allocator_traits = std::allocator_traits<allocator_type>;
 	using value_type = std::byte;
-	using pointer = std::allocator_traits<allocator_type>::pointer;
-	using const_pointer = std::allocator_traits<allocator_type>::const_pointer;
-	static_assert(std::is_same_v<typename std::allocator_traits<allocator_type>::value_type, std::byte>,
+	using pointer = typename allocator_traits::pointer;
+	using const_pointer = typename allocator_traits::const_pointer;
+	static constexpr std::size_t buffer_alignment = BufferAlignment;
+
+private:
+	using storage_unit = call_stream_buffer_storage_unit<buffer_alignment>;
+	using storage_allocator_type = typename allocator_traits::template rebind_alloc<storage_unit>;
+	using storage_allocator_traits = std::allocator_traits<storage_allocator_type>;
+	using storage_pointer = typename storage_allocator_traits::pointer;
+
+	static constexpr bool propagate_on_move_assignment_ =
+		allocator_traits::propagate_on_container_move_assignment::value;
+	static constexpr bool propagate_on_swap_ = allocator_traits::propagate_on_container_swap::value;
+	static constexpr bool is_always_equal_ = allocator_traits::is_always_equal::value;
+	static constexpr bool move_assignment_noexcept_ =
+		propagate_on_move_assignment_
+			? std::is_nothrow_move_assignable_v<allocator_type> &&
+				std::is_nothrow_move_assignable_v<storage_allocator_type>
+			: is_always_equal_;
+	static constexpr bool swap_noexcept_ =
+		propagate_on_swap_
+			? std::is_nothrow_swappable_v<allocator_type> &&
+				std::is_nothrow_swappable_v<storage_allocator_type>
+			: is_always_equal_;
+
+public:
+	static_assert(std::is_same_v<typename allocator_traits::value_type, std::byte>,
 	              "allocator value type must be std::byte");
 	static_assert(std::is_same_v<pointer, std::byte*>,
 	              "call_stream_buffer requires a raw std::byte* allocator pointer");
+	static_assert(std::is_same_v<const_pointer, const std::byte*>,
+	              "call_stream_buffer requires a raw const std::byte* allocator pointer");
+	static_assert(std::is_same_v<storage_pointer, storage_unit*>,
+	              "call_stream_buffer requires raw pointers from rebound storage allocators");
 
 private:
 	MO_YANXI_CALL_STREAM_NO_UNIQUE_ADDRESS allocator_type alloc_;
+	MO_YANXI_CALL_STREAM_NO_UNIQUE_ADDRESS storage_allocator_type storage_alloc_;
+	storage_pointer storage_{nullptr};
 	pointer data_{nullptr};
 	std::size_t size_{0};
 	std::size_t capacity_{0};
+	std::size_t storage_capacity_{0};
 
 public:
-	inline explicit call_stream_buffer(const allocator_type& alloc = allocator_type()) noexcept
-		: alloc_(alloc){
+	inline explicit call_stream_buffer(const allocator_type& alloc = allocator_type())
+		noexcept(std::is_nothrow_copy_constructible_v<allocator_type> &&
+			std::is_nothrow_constructible_v<storage_allocator_type, const allocator_type&>)
+		: alloc_(alloc),
+		  storage_alloc_(alloc){
 	}
 
 	inline call_stream_buffer(const call_stream_buffer&) = delete;
 	inline call_stream_buffer& operator=(const call_stream_buffer&) = delete;
 
-	inline call_stream_buffer(call_stream_buffer&& other) noexcept
+	inline call_stream_buffer(call_stream_buffer&& other) noexcept(
+		std::is_nothrow_move_constructible_v<allocator_type> &&
+		std::is_nothrow_move_constructible_v<storage_allocator_type>)
 		: alloc_(std::move(other.alloc_)),
+		  storage_alloc_(std::move(other.storage_alloc_)),
+		  storage_(std::exchange(other.storage_, nullptr)),
 		  data_(std::exchange(other.data_, nullptr)),
 		  size_(std::exchange(other.size_, 0)),
-		  capacity_(std::exchange(other.capacity_, 0)){
+		  capacity_(std::exchange(other.capacity_, 0)),
+		  storage_capacity_(std::exchange(other.storage_capacity_, 0)){
 	}
 
-	inline call_stream_buffer& operator=(call_stream_buffer&& other) noexcept{
+	inline call_stream_buffer& operator=(call_stream_buffer&& other) noexcept(move_assignment_noexcept_){
 		if(this == &other) return *this;
-		clear_and_deallocate();
-		alloc_ = std::move(other.alloc_);
-		data_ = std::exchange(other.data_, nullptr);
-		size_ = std::exchange(other.size_, 0);
-		capacity_ = std::exchange(other.capacity_, 0);
+
+		if constexpr(propagate_on_move_assignment_){
+			clear_and_deallocate();
+			alloc_ = std::move(other.alloc_);
+			storage_alloc_ = std::move(other.storage_alloc_);
+			steal_from_(other);
+		} else{
+			if constexpr(!is_always_equal_){
+				if(!this->is_allocator_compatible_with(other)){
+					throw std::invalid_argument("call_stream_buffer move assignment requires compatible allocators");
+				}
+			}
+
+			clear_and_deallocate();
+			steal_from_(other);
+		}
 		return *this;
 	}
 
@@ -169,10 +229,16 @@ public:
 	template <typename RelocationCallback>
 		requires std::is_nothrow_invocable_v<RelocationCallback, pointer, pointer>
 	inline pointer allocate_uninitialized(std::size_t extra_size, RelocationCallback&& on_relocate){
-		if(size_ + extra_size > capacity_){
-			this->grow_(size_ + extra_size, std::forward<RelocationCallback>(on_relocate));
+		if(extra_size > std::numeric_limits<std::size_t>::max() - size_){
+			throw std::bad_alloc();
 		}
-		pointer result = data_ + size_;
+
+		const std::size_t required_size = size_ + extra_size;
+		if(required_size > capacity_){
+			this->grow_(required_size, std::forward<RelocationCallback>(on_relocate));
+		}
+
+		pointer result = data_ == nullptr ? nullptr : data_ + size_;
 		size_ += extra_size;
 		return result;
 	}
@@ -190,7 +256,9 @@ public:
 		requires std::is_nothrow_invocable_v<RelocationCallback, pointer, pointer>
 	inline void append(const void* src, std::size_t bytes, RelocationCallback&& on_relocate){
 		pointer dest = this->allocate_uninitialized(bytes, std::forward<RelocationCallback>(on_relocate));
-		std::memcpy(dest, src, bytes);
+		if(bytes > 0){
+			std::memcpy(dest, src, bytes);
+		}
 	}
 
 
@@ -198,7 +266,9 @@ public:
 		requires std::is_nothrow_invocable_v<RelocationCallback, pointer, pointer>
 	inline void append_zeros(std::size_t bytes, RelocationCallback&& on_relocate){
 		pointer dest = this->allocate_uninitialized(bytes, std::forward<RelocationCallback>(on_relocate));
-		std::memset(dest, 0, bytes);
+		if(bytes > 0){
+			std::memset(dest, 0, bytes);
+		}
 	}
 
 	template <typename RelocationCallback>
@@ -214,6 +284,38 @@ public:
 	[[nodiscard]] inline bool empty() const noexcept{ return size_ == 0; }
 	[[nodiscard]] inline allocator_type get_allocator() const noexcept{ return alloc_; }
 
+	template <typename T>
+	[[nodiscard]] inline typename allocator_traits::template rebind_alloc<T> get_rebound_allocator() const{
+		return typename allocator_traits::template rebind_alloc<T>(alloc_);
+	}
+
+	[[nodiscard]] inline bool is_allocator_compatible_with(const call_stream_buffer& other) const
+		noexcept(is_always_equal_ || noexcept(std::declval<const allocator_type&>() == std::declval<const allocator_type&>())){
+		if constexpr(is_always_equal_){
+			return true;
+		} else{
+			return alloc_ == other.alloc_;
+		}
+	}
+
+	[[nodiscard]] inline bool can_move_assign_from(const call_stream_buffer& other) const
+		noexcept(noexcept(this->is_allocator_compatible_with(other))){
+		if constexpr(propagate_on_move_assignment_ || is_always_equal_){
+			return true;
+		} else{
+			return this->is_allocator_compatible_with(other);
+		}
+	}
+
+	[[nodiscard]] inline bool can_swap_with(const call_stream_buffer& other) const
+		noexcept(noexcept(this->is_allocator_compatible_with(other))){
+		if constexpr(propagate_on_swap_ || is_always_equal_){
+			return true;
+		} else{
+			return this->is_allocator_compatible_with(other);
+		}
+	}
+
 	inline void clear() noexcept{
 		size_ = 0;
 	}
@@ -223,25 +325,107 @@ public:
 		size_ = previous_size;
 	}
 
+	inline void swap(call_stream_buffer& other) noexcept(swap_noexcept_){
+		if(this == &other) return;
+
+		if constexpr(propagate_on_swap_){
+			std::ranges::swap(alloc_, other.alloc_);
+			std::ranges::swap(storage_alloc_, other.storage_alloc_);
+		} else{
+			if constexpr(!is_always_equal_){
+				if(!this->is_allocator_compatible_with(other)){
+					throw std::invalid_argument("call_stream_buffer swap requires compatible allocators");
+				}
+			}
+		}
+
+		std::ranges::swap(storage_, other.storage_);
+		std::ranges::swap(data_, other.data_);
+		std::ranges::swap(size_, other.size_);
+		std::ranges::swap(capacity_, other.capacity_);
+		std::ranges::swap(storage_capacity_, other.storage_capacity_);
+	}
+
+	friend void swap(call_stream_buffer& lhs, call_stream_buffer& rhs) noexcept(swap_noexcept_){
+		lhs.swap(rhs);
+	}
+
 private:
 	inline void clear_and_deallocate() noexcept{
-		if(data_){
-			std::allocator_traits<allocator_type>::deallocate(alloc_, data_, capacity_);
+		if(storage_){
+			storage_allocator_traits::deallocate(storage_alloc_, storage_, storage_capacity_);
+			storage_ = nullptr;
 			data_ = nullptr;
 			size_ = 0;
 			capacity_ = 0;
+			storage_capacity_ = 0;
 		}
+	}
+
+	inline void steal_from_(call_stream_buffer& other) noexcept{
+		storage_ = std::exchange(other.storage_, nullptr);
+		data_ = std::exchange(other.data_, nullptr);
+		size_ = std::exchange(other.size_, 0);
+		capacity_ = std::exchange(other.capacity_, 0);
+		storage_capacity_ = std::exchange(other.storage_capacity_, 0);
+	}
+
+	[[nodiscard]] inline std::size_t max_byte_capacity_() const{
+		const std::size_t max_units = storage_allocator_traits::max_size(storage_alloc_);
+		constexpr std::size_t max_units_by_size =
+			std::numeric_limits<std::size_t>::max() / buffer_alignment;
+		return std::min(max_units, max_units_by_size) * buffer_alignment;
+	}
+
+	[[nodiscard]] inline std::size_t units_for_bytes_(std::size_t bytes) const{
+		const std::size_t max_bytes = max_byte_capacity_();
+		if(bytes > max_bytes){
+			throw std::bad_alloc();
+		}
+
+		return (bytes + buffer_alignment - 1) / buffer_alignment;
+	}
+
+	[[nodiscard]] inline std::size_t bytes_for_units_(std::size_t units) const{
+		const std::size_t max_units = storage_allocator_traits::max_size(storage_alloc_);
+		if(units > max_units || units > std::numeric_limits<std::size_t>::max() / buffer_alignment){
+			throw std::bad_alloc();
+		}
+
+		return units * buffer_alignment;
+	}
+
+	[[nodiscard]] inline std::size_t next_capacity_(std::size_t required_capacity) const{
+		const std::size_t max_bytes = max_byte_capacity_();
+		if(required_capacity > max_bytes){
+			throw std::bad_alloc();
+		}
+
+		std::size_t new_capacity = capacity_ < 512 ? 512 : capacity_;
+		while(new_capacity < required_capacity){
+			if(new_capacity > max_bytes / 2){
+				new_capacity = max_bytes;
+				break;
+			}
+			new_capacity *= 2;
+		}
+
+		if(new_capacity < required_capacity){
+			throw std::bad_alloc();
+		}
+
+		return bytes_for_units_(units_for_bytes_(new_capacity));
 	}
 
 
 	template <typename RelocationCallback>
-	MO_YANXI_CALL_STREAM_FORCE_INLINE inline void grow_(std::size_t required_capacity, RelocationCallback&& on_relocate){
-		std::size_t new_capacity = capacity_ < 512 ? 512 : capacity_ * 2;
-		while(new_capacity < required_capacity){
-			new_capacity *= 2;
-		}
+	MO_YANXI_CALL_STREAM_FORCE_INLINE inline void
+	grow_(std::size_t required_capacity, RelocationCallback&& on_relocate){
+		const std::size_t new_capacity = next_capacity_(required_capacity);
+		const std::size_t new_storage_capacity = units_for_bytes_(new_capacity);
 
-		pointer new_data = std::allocator_traits<allocator_type>::allocate(alloc_, new_capacity);
+		storage_pointer new_storage = storage_allocator_traits::allocate(storage_alloc_, new_storage_capacity);
+		pointer new_data = reinterpret_cast<pointer>(new_storage);
 
 		if(data_ != nullptr){
 			if(size_ > 0){
@@ -250,11 +434,13 @@ private:
 				MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS on_relocate(data_, new_data);
 			}
 
-			std::allocator_traits<allocator_type>::deallocate(alloc_, data_, capacity_);
+			storage_allocator_traits::deallocate(storage_alloc_, storage_, storage_capacity_);
 		}
 
+		storage_ = new_storage;
 		data_ = new_data;
 		capacity_ = new_capacity;
+		storage_capacity_ = new_storage_capacity;
 	}
 };
 }
@@ -272,6 +458,8 @@ using call_stream_invoke_arg_t = std::conditional_t<
 	Arg,
 	std::add_lvalue_reference_t<Arg>>;
 
+#pragma region ConceptHelper
+
 template <typename Ret, typename Fn, typename... Args>
 concept call_stream_invocable = std::is_invocable_r_v<Ret, Fn, call_stream_invoke_arg_t<Args>...>;
 
@@ -285,6 +473,14 @@ concept call_stream_policy_invocable =
 	call_stream_invocable<Ret, Fn, Args...> &&
 	(ExceptionPolicy != call_stream_exception_policy::nothrow ||
 		call_stream_nothrow_invocable<Ret, Fn, Args...>);
+
+template <typename T, typename Alloc, typename... Args>
+concept call_stream_payload_constructible =
+	std::constructible_from<T, Args...> ||
+	(std::uses_allocator_v<T, Alloc> &&
+		requires(T* ptr, const Alloc& alloc, Args&&... args){
+			std::uninitialized_construct_using_allocator(ptr, alloc, std::forward<Args>(args)...);
+		});
 
 template <typename T, typename Ret, typename... Args>
 concept has_compatible_static_call_operator =
@@ -304,6 +500,8 @@ concept has_compatible_nothrow_static_call_operator =
 		requires noexcept(T::operator()(std::declval<call_stream_invoke_arg_t<Args>>()...));
 	};
 
+#pragma endregion
+
 template <typename Arg>
 MO_YANXI_CALL_STREAM_FORCE_INLINE decltype(auto) forward_invoke_arg_(std::remove_reference_t<Arg>& arg) noexcept{
 	if constexpr(std::is_reference_v<Arg>){
@@ -319,11 +517,11 @@ using call_stream_link_return_t = std::conditional_t<UseTailDispatch, void, std:
 
 template <typename RetValue>
 using call_stream_throwing_invoker_fn =
-	RetValue(*)(std::byte* current_instr_base, const std::byte* end, void* invoke_args_ptr);
+RetValue(*)(std::byte* current_instr_base, const std::byte* end, void* invoke_args_ptr);
 
 template <typename RetValue>
 using call_stream_nothrow_invoker_fn =
-	RetValue(*)(std::byte* current_instr_base, const std::byte* end, void* invoke_args_ptr) noexcept;
+RetValue(*)(std::byte* current_instr_base, const std::byte* end, void* invoke_args_ptr) noexcept;
 
 template <bool IsNoexcept, typename RetValue>
 using call_stream_invoker_fn_t = std::conditional_t<
@@ -374,8 +572,11 @@ class call_stream_result_slot<Ret, false>{
 	union storage_type{
 		Ret value;
 
-		inline constexpr storage_type() noexcept {}
-		inline ~storage_type() noexcept {}
+		inline constexpr storage_type() noexcept{
+		}
+
+		inline ~storage_type() noexcept{
+		}
 	};
 
 	storage_type storage_;
@@ -429,7 +630,8 @@ class call_stream_result_slot<Ret, true>{
 	union storage_type{
 		Ret value;
 
-		inline constexpr storage_type() noexcept {}
+		inline constexpr storage_type() noexcept{
+		}
 	};
 
 	storage_type storage_;
@@ -608,9 +810,10 @@ struct is_cmd_call<cmd_call<Fn>> : std::true_type{
 template <typename T>
 concept not_cmd_call = !is_cmd_call<std::remove_cvref_t<T>>::value;
 
-MO_YANXI_CALL_STREAM_FORCE_INLINE constexpr std::size_t align_forward(std::size_t offset, std::size_t alignment) noexcept{
+MO_YANXI_CALL_STREAM_FORCE_INLINE constexpr std::size_t align_forward(std::size_t offset,
+                                                                      std::size_t alignment) noexcept{
 	assert(std::has_single_bit(alignment));
-	std::size_t aligned = (offset + alignment - 1) & ~(alignment - 1);
+	std::size_t aligned = (offset + alignment - 1uz) & ~(alignment - 1uz);
 	assert(aligned >= offset);
 	return aligned;
 }
@@ -653,9 +856,9 @@ public:
 private:
 	struct
 #if MO_YANXI_CALL_STREAM_COMPILER_MSVC
-	alignas(16)
+		alignas(16)
 #endif
-	instr_header{
+		instr_header{
 		invoker_fn invoker;
 	};
 
@@ -670,12 +873,13 @@ private:
 	};
 
 	using void_tail_dispatch_context =
-		call_stream_void_tail_dispatch_context<has_tail_dispatch_ && !is_nothrow>;
+	call_stream_void_tail_dispatch_context<has_tail_dispatch_ && !is_nothrow>;
 
 	using resource_allocator_type =
 	std::allocator_traits<Allocator>::template rebind_alloc<resource_record>;
+	using buffer_type = call_stream_buffer<Allocator, alignof(instr_header)>;
 
-	call_stream_buffer<Allocator> buffer_;
+	buffer_type buffer_;
 	std::vector<resource_record, resource_allocator_type> resources_;
 	std::size_t ip_{0};
 
@@ -706,6 +910,26 @@ private:
 			});
 	}
 
+	template <typename T, typename TypedAlloc, typename... CtorArgs>
+	inline static void construct_payload_(TypedAlloc& alloc, T* ptr, CtorArgs&&... args){
+		if constexpr(std::uses_allocator_v<T, TypedAlloc>){
+			std::uninitialized_construct_using_allocator(ptr, alloc, std::forward<CtorArgs>(args)...);
+		} else{
+			std::allocator_traits<TypedAlloc>::construct(alloc, ptr, std::forward<CtorArgs>(args)...);
+		}
+	}
+
+	[[nodiscard]] inline bool can_transfer_storage_from_(const basic_call_stream_impl& other) const
+		noexcept(noexcept(buffer_.is_allocator_compatible_with(other.buffer_))){
+		return buffer_.is_allocator_compatible_with(other.buffer_);
+	}
+
+	inline void require_transfer_compatible_(const basic_call_stream_impl& other) const{
+		if(!this->can_transfer_storage_from_(other)){
+			throw std::invalid_argument("call_stream storage transfer requires compatible allocators");
+		}
+	}
+
 	template <typename... CallArgs>
 	inline static result_state make_result_state_(CallArgs&&... args)
 		noexcept(std::is_nothrow_constructible_v<invoke_args, CallArgs&&...>)
@@ -726,7 +950,7 @@ private:
 
 	inline void set_ip_to_ptr_(const std::byte* ptr) noexcept{
 		const std::byte* base = buffer_.data();
-		const std::byte* end = base + buffer_.size();
+		[[maybe_unused]] const std::byte* end = base + buffer_.size();
 		MO_YANXI_CALL_STREAM_ASSUME(ptr >= base);
 		MO_YANXI_CALL_STREAM_ASSUME(ptr <= end);
 		ip_ = static_cast<std::size_t>(ptr - base);
@@ -865,7 +1089,7 @@ private:
 			context.result.emplace(
 				basic_call_stream_impl::invoke_static_with_args_<T>(
 					context.args,
-				std::index_sequence_for<Args...>{}));
+					std::index_sequence_for<Args...>{}));
 		}
 	}
 
@@ -957,7 +1181,10 @@ private:
 	}
 
 	template <typename FnTy, bool AllowStaticDispatch, typename... CtorArgs>
-		requires(std::constructible_from<FnTy, CtorArgs&&...> &&
+		requires(call_stream_payload_constructible<
+				FnTy,
+				typename std::allocator_traits<Allocator>::template rebind_alloc<FnTy>,
+				CtorArgs&&...> &&
 			call_stream_policy_invocable<ExceptionPolicy, Ret, FnTy&, Args...>)
 	inline void emplace_call_(CtorArgs&&... args);
 
@@ -1034,7 +1261,8 @@ private:
 	}
 
 	template <typename ResultContext>
-	MO_YANXI_CALL_STREAM_FORCE_INLINE inline void execute_scalar_result_context_(ResultContext& context) noexcept(is_nothrow)
+	MO_YANXI_CALL_STREAM_FORCE_INLINE inline void execute_scalar_result_context_(
+		ResultContext& context) noexcept(is_nothrow)
 		requires(uses_scalar_result_){
 		std::byte* ptr = buffer_.data() + ip_;
 		const std::byte* end = buffer_.data() + buffer_.size();
@@ -1083,7 +1311,7 @@ private:
 			if constexpr(is_nothrow){
 				void_tail_dispatch_context tail_context{
 						.invoke_args = context_ptr
-				};
+					};
 				invoker(ptr, end, std::addressof(tail_context));
 			} else{
 				void_tail_dispatch_context tail_context{
@@ -1133,15 +1361,24 @@ public:
 		: buffer_(std::move(other.buffer_)),
 		  resources_(std::move(other.resources_)),
 		  ip_(std::exchange(other.ip_, 0)){
+		other.resources_.clear();
 	}
 
 	inline basic_call_stream_impl& operator=(basic_call_stream_impl&& other) noexcept(
-		std::is_nothrow_move_assignable_v<decltype(buffer_)> &&
+		noexcept(std::declval<decltype(buffer_)&>().can_move_assign_from(std::declval<const decltype(buffer_)&>())) &&
+		noexcept(std::declval<decltype(buffer_)&>() = std::declval<decltype(buffer_)&&>()) &&
 		std::is_nothrow_move_assignable_v<decltype(resources_)>){
 		if(this == &other) return *this;
+		if constexpr(!noexcept(std::declval<decltype(buffer_)&>() = std::declval<decltype(buffer_)&&>())){
+			if(!buffer_.can_move_assign_from(other.buffer_)){
+				throw std::invalid_argument("call_stream move assignment requires compatible allocators");
+			}
+		}
+
 		clear_res_();
 		buffer_ = std::move(other.buffer_);
 		resources_ = std::move(other.resources_);
+		other.resources_.clear();
 		ip_ = std::exchange(other.ip_, 0);
 		return *this;
 	}
@@ -1169,7 +1406,7 @@ public:
 
 		auto* raw_mem = buffer_.allocate_uninitialized(total_bytes, get_relocate_cb());
 		new(std::assume_aligned<alignof(instr_header)>(
-			static_cast<instr_header*>(static_cast<void*>(raw_mem)))) instr_header{
+				static_cast<instr_header*>(static_cast<void*>(raw_mem)))) instr_header{
 				.invoker = invoker
 			};
 
@@ -1200,7 +1437,7 @@ public:
 
 			auto* raw_mem = buffer_.allocate_uninitialized(total_bytes, get_relocate_cb());
 			new(std::assume_aligned<alignof(instr_header)>(
-				static_cast<instr_header*>(static_cast<void*>(raw_mem)))) instr_header{
+					static_cast<instr_header*>(static_cast<void*>(raw_mem)))) instr_header{
 					.invoker = invoker
 				};
 
@@ -1235,7 +1472,7 @@ public:
 
 			auto* raw_mem = buffer_.allocate_uninitialized(total_bytes, get_relocate_cb());
 			new(std::assume_aligned<alignof(instr_header)>(
-				static_cast<instr_header*>(static_cast<void*>(raw_mem)))) instr_header{
+					static_cast<instr_header*>(static_cast<void*>(raw_mem)))) instr_header{
 					.invoker = invoker
 				};
 
@@ -1386,13 +1623,15 @@ public:
 		ip_ = 0;
 	}
 
-	inline void merge(basic_call_stream_impl&& other){
+	inline void append(basic_call_stream_impl&& other){
 		if(this == &other || other.empty()) return;
 
 		if(this->empty()){
 			*this = std::move(other);
 			return;
 		}
+
+		this->require_transfer_compatible_(other);
 
 		ensure_header_alignment();
 
@@ -1423,27 +1662,48 @@ public:
 	}
 
 	template <typename Fn>
-		requires(std::constructible_from<Fn, const Fn&> &&
+		requires(call_stream_payload_constructible<
+				Fn,
+				typename std::allocator_traits<Allocator>::template rebind_alloc<Fn>,
+				const Fn&> &&
 			call_stream_policy_invocable<ExceptionPolicy, Ret, Fn&, Args...>)
 	inline void push_back(const cmd_call<Fn>& call);
 
 	template <typename Fn>
-		requires(std::constructible_from<Fn, Fn&&> &&
+		requires(call_stream_payload_constructible<
+				Fn,
+				typename std::allocator_traits<Allocator>::template rebind_alloc<Fn>,
+				Fn&&> &&
 			call_stream_policy_invocable<ExceptionPolicy, Ret, Fn&, Args...>)
 	inline void push_back(cmd_call<Fn>&& call);
 
 	template <typename Fn>
-		requires(std::constructible_from<std::decay_t<Fn>, Fn&&> &&
+		requires(call_stream_payload_constructible<
+				std::decay_t<Fn>,
+				typename std::allocator_traits<Allocator>::template rebind_alloc<std::decay_t<Fn>>,
+				Fn&&> &&
 			call_stream_policy_invocable<ExceptionPolicy, Ret, std::decay_t<Fn>&, Args...>)
 	inline void emplace_back(Fn&& fn);
 
 	template <typename FnTy, typename... Ts>
-		requires(std::constructible_from<FnTy, Ts&&...> &&
+		requires(call_stream_payload_constructible<
+				FnTy,
+				typename std::allocator_traits<Allocator>::template rebind_alloc<FnTy>,
+				Ts&&...> &&
 			call_stream_policy_invocable<ExceptionPolicy, Ret, FnTy&, Args...>)
 	inline void emplace_back(Ts&&... args);
 
 	friend void swap(basic_call_stream_impl& lhs,
-	                 basic_call_stream_impl& rhs) noexcept(std::is_nothrow_swappable_v<decltype(buffer_)>){
+	                 basic_call_stream_impl& rhs) noexcept(
+			noexcept(std::declval<decltype(buffer_)&>().can_swap_with(std::declval<const decltype(buffer_)&>())) &&
+			noexcept(std::ranges::swap(std::declval<decltype(buffer_)&>(), std::declval<decltype(buffer_)&>())) &&
+			std::is_nothrow_swappable_v<decltype(resources_)>){
+		if constexpr(!noexcept(std::ranges::swap(std::declval<decltype(buffer_)&>(), std::declval<decltype(buffer_)&>()))){
+			if(!lhs.buffer_.can_swap_with(rhs.buffer_)){
+				throw std::invalid_argument("call_stream swap requires compatible allocators");
+			}
+		}
+
 		std::ranges::swap(lhs.buffer_, rhs.buffer_);
 		std::ranges::swap(lhs.resources_, rhs.resources_);
 		std::ranges::swap(lhs.ip_, rhs.ip_);
@@ -1461,20 +1721,18 @@ struct cmd_call{
 		: callable(std::forward<Args>(args)...){
 	}
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE inline decltype(auto) operator()() &
-		noexcept(std::is_nothrow_invocable_v<Fn&>)
+	MO_YANXI_CALL_STREAM_FORCE_INLINE inline decltype(auto) operator()() & noexcept(std::is_nothrow_invocable_v<Fn&>)
 		requires std::invocable<Fn&>{
 		return std::invoke(this->callable);
 	}
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE inline decltype(auto) operator()() &&
-		noexcept(std::is_nothrow_invocable_v<Fn>)
+	MO_YANXI_CALL_STREAM_FORCE_INLINE inline decltype(auto) operator()() && noexcept(std::is_nothrow_invocable_v<Fn>)
 		requires std::invocable<Fn>{
 		return std::invoke(std::move(this->callable));
 	}
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE inline decltype(auto) operator()() const &
-		noexcept(std::is_nothrow_invocable_v<const Fn&>)
+	MO_YANXI_CALL_STREAM_FORCE_INLINE inline decltype(auto) operator(
+	)() const & noexcept(std::is_nothrow_invocable_v<const Fn&>)
 		requires std::invocable<const Fn&>{
 		return std::invoke(this->callable);
 	}
@@ -1485,76 +1743,89 @@ cmd_call(Fn&&) -> cmd_call<std::decay_t<Fn>>;
 
 export template <typename Allocator, typename Ret, typename... Args>
 using basic_call_stream =
-	basic_call_stream_impl<call_stream_exception_policy::resumable, Allocator, Ret, Args...>;
+basic_call_stream_impl<call_stream_exception_policy::resumable, Allocator, Ret, Args...>;
 
 export template <typename Allocator, typename Ret, typename... Args>
 using basic_noexcept_call_stream =
-	basic_call_stream_impl<call_stream_exception_policy::nothrow, Allocator, Ret, Args...>;
+basic_call_stream_impl<call_stream_exception_policy::nothrow, Allocator, Ret, Args...>;
 
 export template <
 	typename FnSign = void(),
 	typename Allocator = std::allocator<std::byte>,
 	call_stream_exception_policy ExceptionPolicy = call_stream_default_exception_policy<FnSign>::value>
-using call_stream = typename basic_call_stream_selector<Allocator, FnSign, ExceptionPolicy>::type;
+using call_stream = basic_call_stream_selector<Allocator, FnSign, ExceptionPolicy>::type;
 
 export template <typename FnSign = void(), typename Allocator = std::allocator<std::byte>>
 using noexcept_call_stream =
-	typename basic_call_stream_selector<Allocator, FnSign, call_stream_exception_policy::nothrow>::type;
+basic_call_stream_selector<Allocator, FnSign, call_stream_exception_policy::nothrow>::type;
 
 #pragma region StreamImpl
 template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename FnTy, bool AllowStaticDispatch, typename... CtorArgs>
-	requires(std::constructible_from<FnTy, CtorArgs&&...> &&
+	requires(call_stream_payload_constructible<
+			FnTy,
+			typename std::allocator_traits<Allocator>::template rebind_alloc<FnTy>,
+			CtorArgs&&...> &&
 		call_stream_policy_invocable<ExceptionPolicy, Ret, FnTy&, Args...>)
 inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_call_(CtorArgs&&... args){
 	using PayloadT = FnTy;
+	using TypedAlloc = std::allocator_traits<Allocator>::template rebind_alloc<PayloadT>;
+	using TypedAllocTraits = std::allocator_traits<TypedAlloc>;
+	static constexpr bool uses_payload_allocator = std::uses_allocator_v<PayloadT, TypedAlloc>;
 
 
-	if constexpr(AllowStaticDispatch){
+	if constexpr(AllowStaticDispatch && !uses_payload_allocator){
 		constexpr bool is_static = has_compatible_static_call_operator<PayloadT, Ret, Args...> &&
-			(ExceptionPolicy != call_stream_exception_policy::nothrow ||
-				has_compatible_nothrow_static_call_operator<PayloadT, Ret, Args...>);
+		(ExceptionPolicy != call_stream_exception_policy::nothrow ||
+			has_compatible_nothrow_static_call_operator<PayloadT, Ret, Args...>);
 		constexpr bool is_empty = std::is_empty_v<PayloadT> &&
 			std::default_initializable<PayloadT> &&
 			call_stream_policy_invocable<ExceptionPolicy, Ret, const PayloadT&, Args...>;
 		if constexpr(!std::is_pointer_v<PayloadT> && (is_static || is_empty)){
 			this->emit_instruction(+[](std::byte* base, const std::byte* end,
-			                           void* invoke_args_ptr) static noexcept(invoker_is_nothrow_) -> invoke_fn_return_type{
-				std::byte* next_ptr = base + sizeof(instr_header);
-				if constexpr(uses_scalar_result_){
-					Ret result = [&]{
-						if constexpr(is_static){
-							return basic_call_stream_impl::invoke_static_scalar_payload_<PayloadT>(invoke_args_ptr);
-						} else{
-							static const PayloadT fn_raw{};
-							return basic_call_stream_impl::invoke_scalar_payload_(fn_raw, invoke_args_ptr);
-						}
-					}();
-					finish_scalar_result_instruction_(invoke_args_ptr, next_ptr);
-					return result;
-				} else{
-					if constexpr(std::is_void_v<Ret>){
-						basic_call_stream_impl::record_current_instruction_(invoke_args_ptr, base);
-						MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
-							basic_call_stream_impl::template invoke_zero_payload_void_<PayloadT, is_static>(
-								invoke_args_ptr);
-						};
-						return basic_call_stream_impl::tail_dispatch_after_void_payload_(
-							next_ptr, end, invoke_args_ptr);
-					} else{
-						MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
-							if constexpr(is_static){
-								basic_call_stream_impl::invoke_static_payload_<PayloadT>(invoke_args_ptr);
-							} else{
-								static const PayloadT fn_raw{};
-								basic_call_stream_impl::invoke_payload_(fn_raw, invoke_args_ptr);
-							}
-						};
+			                           void* invoke_args_ptr) static noexcept(invoker_is_nothrow_) ->
+			                       invoke_fn_return_type{
+				                       std::byte* next_ptr = base + sizeof(instr_header);
+				                       if constexpr(uses_scalar_result_){
+					                       Ret result = [&]{
+						                       if constexpr(is_static){
+							                       return basic_call_stream_impl::invoke_static_scalar_payload_<
+								                       PayloadT>(invoke_args_ptr);
+						                       } else{
+							                       static const PayloadT fn_raw{};
+							                       return basic_call_stream_impl::invoke_scalar_payload_(
+								                       fn_raw, invoke_args_ptr);
+						                       }
+					                       }();
+					                       finish_scalar_result_instruction_(invoke_args_ptr, next_ptr);
+					                       return result;
+				                       } else{
+					                       if constexpr(std::is_void_v<Ret>){
+						                       basic_call_stream_impl::record_current_instruction_(
+							                       invoke_args_ptr, base);
+						                       MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
+							                       basic_call_stream_impl::invoke_zero_payload_void_<
+								                       PayloadT, is_static>(
+								                       invoke_args_ptr);
+						                       };
+						                       return basic_call_stream_impl::tail_dispatch_after_void_payload_(
+							                       next_ptr, end, invoke_args_ptr);
+					                       } else{
+						                       MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
+							                       if constexpr(is_static){
+								                       basic_call_stream_impl::invoke_static_payload_<PayloadT>(
+									                       invoke_args_ptr);
+							                       } else{
+								                       static const PayloadT fn_raw{};
+								                       basic_call_stream_impl::invoke_payload_(fn_raw, invoke_args_ptr);
+							                       }
+						                       };
 
-						return basic_call_stream_impl::finish_result_instruction_(invoke_args_ptr, next_ptr);
-					}
-				}
-			}, nullptr, 0, 1);
+						                       return basic_call_stream_impl::finish_result_instruction_(
+							                       invoke_args_ptr, next_ptr);
+					                       }
+				                       }
+			                       }, nullptr, 0, 1);
 			return;
 		}
 	}
@@ -1566,49 +1837,48 @@ inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::em
 
 
 	static constexpr auto fptr = +[](std::byte* base, const std::byte* end,
-	                                 void* invoke_args_ptr) static noexcept(invoker_is_nothrow_) -> invoke_fn_return_type{
-		static constexpr std::size_t offset = align_forward(sizeof(instr_header), alignof(PayloadT));
-		static constexpr std::size_t total_size = align_forward(offset + sizeof(PayloadT), alignof(instr_header));
+	                                 void* invoke_args_ptr) static noexcept(invoker_is_nothrow_) ->
+		invoke_fn_return_type{
+			static constexpr std::size_t offset = align_forward(sizeof(instr_header), alignof(PayloadT));
+			static constexpr std::size_t total_size = align_forward(offset + sizeof(PayloadT), alignof(instr_header));
 
-		std::byte* next_ptr = base + total_size;
-		if constexpr(uses_scalar_result_){
-			auto& obj = *std::launder(std::assume_aligned<alignof(PayloadT)>(
-				static_cast<PayloadT*>(static_cast<void*>(base + offset))));
-			Ret result = basic_call_stream_impl::invoke_scalar_payload_(obj, invoke_args_ptr);
-			finish_scalar_result_instruction_(invoke_args_ptr, next_ptr);
-			return result;
-		} else if constexpr(std::is_void_v<Ret>){
-			basic_call_stream_impl::record_current_instruction_(invoke_args_ptr, base);
-			basic_call_stream_impl::template invoke_inline_void_payload_<PayloadT, offset>(
-				base, invoke_args_ptr);
-			return basic_call_stream_impl::tail_dispatch_after_void_payload_(next_ptr, end, invoke_args_ptr);
-		} else{
-			auto& obj = *std::launder(std::assume_aligned<alignof(PayloadT)>(
-				static_cast<PayloadT*>(static_cast<void*>(base + offset))));
-			MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
-				basic_call_stream_impl::invoke_payload_(obj, invoke_args_ptr);
+			std::byte* next_ptr = base + total_size;
+			if constexpr(uses_scalar_result_){
+				auto& obj = *std::launder(std::assume_aligned<alignof(PayloadT)>(
+					static_cast<PayloadT*>(static_cast<void*>(base + offset))));
+				Ret result = basic_call_stream_impl::invoke_scalar_payload_(obj, invoke_args_ptr);
+				finish_scalar_result_instruction_(invoke_args_ptr, next_ptr);
+				return result;
+			} else if constexpr(std::is_void_v<Ret>){
+				basic_call_stream_impl::record_current_instruction_(invoke_args_ptr, base);
+				basic_call_stream_impl::invoke_inline_void_payload_<PayloadT, offset>(
+					base, invoke_args_ptr);
+				return basic_call_stream_impl::tail_dispatch_after_void_payload_(next_ptr, end, invoke_args_ptr);
+			} else{
+				auto& obj = *std::launder(std::assume_aligned<alignof(PayloadT)>(
+					static_cast<PayloadT*>(static_cast<void*>(base + offset))));
+				MO_YANXI_CALL_STREAM_FORCEINLINE_CALLS {
+					basic_call_stream_impl::invoke_payload_(obj, invoke_args_ptr);
+				}
+
+				return basic_call_stream_impl::finish_result_instruction_(invoke_args_ptr, next_ptr);
 			}
-
-			return basic_call_stream_impl::finish_result_instruction_(invoke_args_ptr, next_ptr);
-		}
-	};
+		};
 
 
-	if constexpr(is_trivial && can_store_inline){
+	if constexpr(!uses_payload_allocator && is_trivial && can_store_inline){
 		PayloadT payload(std::forward<CtorArgs>(args)...);
 		this->emit_instruction(fptr, &payload, sizeof(PayloadT), alignof(PayloadT));
-	} else if constexpr(can_store_inline && std::is_nothrow_move_constructible_v<PayloadT>){
+	} else if constexpr(!uses_payload_allocator && can_store_inline && std::is_nothrow_move_constructible_v<PayloadT>){
 		this->template emit_non_trivial_call_inline<PayloadT>(fptr, std::forward<CtorArgs>(args)...);
 	} else{
-		using TypedAlloc = std::allocator_traits<Allocator>::template rebind_alloc<PayloadT>;
-		using TypedAllocTraits = std::allocator_traits<TypedAlloc>;
 		static_assert(std::is_same_v<typename TypedAllocTraits::pointer, PayloadT*>,
 		              "call_stream requires raw pointers from rebound payload allocators");
-		TypedAlloc alloc(this->get_allocator());
+		TypedAlloc alloc(this->buffer_.template get_rebound_allocator<PayloadT>());
 		PayloadT* heap_obj = TypedAllocTraits::allocate(alloc, 1);
 
 		try{
-			TypedAllocTraits::construct(alloc, heap_obj, std::forward<CtorArgs>(args)...);
+			basic_call_stream_impl::construct_payload_(alloc, heap_obj, std::forward<CtorArgs>(args)...);
 		} catch(...){
 			TypedAllocTraits::deallocate(alloc, heap_obj, 1);
 			throw;
@@ -1632,7 +1902,7 @@ inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::em
 						return result;
 					} else if constexpr(std::is_void_v<Ret>){
 						basic_call_stream_impl::record_current_instruction_(invoke_args_ptr, base);
-						basic_call_stream_impl::template invoke_heap_void_payload_<PayloadT, payload_offset>(
+						basic_call_stream_impl::invoke_heap_void_payload_<PayloadT, payload_offset>(
 							base, invoke_args_ptr);
 						return basic_call_stream_impl::tail_dispatch_after_void_payload_(
 							next_ptr, end, invoke_args_ptr);
@@ -1647,7 +1917,8 @@ inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::em
 					}
 				},
 				heap_obj,
-				+[] MO_YANXI_CALL_STREAM_FORCE_INLINE (basic_call_stream_impl& s, void* old_base, void* new_base) noexcept{
+				+[] MO_YANXI_CALL_STREAM_FORCE_INLINE (basic_call_stream_impl& s, void* old_base,
+				                                       void* new_base) noexcept{
 					if(new_base) return;
 					constexpr std::size_t p_off = align_forward(
 						sizeof(instr_header), alignof(PayloadT*));
@@ -1655,7 +1926,7 @@ inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::em
 						*std::launder(std::assume_aligned<alignof(PayloadT*)>(
 							static_cast<PayloadT**>(static_cast<void*>(static_cast<std::byte*>(old_base) + p_off))));
 
-					TypedAlloc del_alloc(s.get_allocator());
+					TypedAlloc del_alloc(s.buffer_.template get_rebound_allocator<PayloadT>());
 					TypedAllocTraits::destroy(del_alloc, typed_ptr);
 					TypedAllocTraits::deallocate(del_alloc, typed_ptr, 1);
 				}
@@ -1670,7 +1941,10 @@ inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::em
 
 template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename Fn>
-	requires(std::constructible_from<std::decay_t<Fn>, Fn&&> &&
+	requires(call_stream_payload_constructible<
+			std::decay_t<Fn>,
+			typename std::allocator_traits<Allocator>::template rebind_alloc<std::decay_t<Fn>>,
+			Fn&&> &&
 		call_stream_policy_invocable<ExceptionPolicy, Ret, std::decay_t<Fn>&, Args...>)
 inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_back(Fn&& fn){
 	this->template emplace_call_<std::decay_t<Fn>, true>(std::forward<Fn>(fn));
@@ -1678,7 +1952,10 @@ inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::em
 
 template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename FnTy, typename... Ts>
-	requires(std::constructible_from<FnTy, Ts&&...> &&
+	requires(call_stream_payload_constructible<
+			FnTy,
+			typename std::allocator_traits<Allocator>::template rebind_alloc<FnTy>,
+			Ts&&...> &&
 		call_stream_policy_invocable<ExceptionPolicy, Ret, FnTy&, Args...>)
 inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_back(Ts&&... args){
 	this->template emplace_call_<FnTy, sizeof...(Ts) == 0>(std::forward<Ts>(args)...);
@@ -1686,7 +1963,10 @@ inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::em
 
 template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename Fn>
-	requires(std::constructible_from<Fn, const Fn&> &&
+	requires(call_stream_payload_constructible<
+			Fn,
+			typename std::allocator_traits<Allocator>::template rebind_alloc<Fn>,
+			const Fn&> &&
 		call_stream_policy_invocable<ExceptionPolicy, Ret, Fn&, Args...>)
 inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::push_back(const cmd_call<Fn>& call){
 	this->emplace_back(call.callable);
@@ -1694,13 +1974,17 @@ inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::pu
 
 template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args>
 template <typename Fn>
-	requires(std::constructible_from<Fn, Fn&&> &&
+	requires(call_stream_payload_constructible<
+			Fn,
+			typename std::allocator_traits<Allocator>::template rebind_alloc<Fn>,
+			Fn&&> &&
 		call_stream_policy_invocable<ExceptionPolicy, Ret, Fn&, Args...>)
 inline void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::push_back(cmd_call<Fn>&& call){
 	this->emplace_back(std::move(call.callable));
 }
 
-export template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args, typename Fn>
+export template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args,
+                 typename Fn>
 	requires(not_cmd_call<Fn> &&
 		requires(basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& stream, Fn&& call){
 			stream.emplace_back(std::forward<Fn>(call));
@@ -1711,7 +1995,8 @@ basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& operator<<(
 	return stream;
 }
 
-export template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args, typename Fn>
+export template <call_stream_exception_policy ExceptionPolicy, typename Allocator, typename Ret, typename... Args,
+                 typename Fn>
 	requires requires(basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& stream, cmd_call<Fn>&& call){
 		stream.push_back(std::move(call));
 	}
@@ -1721,5 +2006,4 @@ basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>& operator<<(
 	return stream;
 }
 #pragma endregion
-
 }

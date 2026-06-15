@@ -13,6 +13,12 @@ option("ubsan")
     set_description("Enable UndefinedBehaviorSanitizer for Clang host builds")
 option_end()
 
+option("force_dispatch_macros")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Force benchmark dispatch tuning macros on")
+option_end()
+
 set_policy("build.c++.modules", true)
 add_rules("mode.debug", "mode.release")
 
@@ -42,6 +48,11 @@ if has_config("host_project") then
     end
 
     add_vectorexts("avx", "avx2")
+
+    if has_config("force_dispatch_macros") then
+        add_defines("MO_YANXI_CALL_STREAM_USE_TAIL_DISPATCH=1")
+        add_defines("MO_YANXI_CALL_STREAM_USE_SCALAR_RESULT_DISPATCH=1")
+    end
 
     if is_plat("windows") then
         -- LLVM's Windows UBSan runtime is only available here as an MT static library.

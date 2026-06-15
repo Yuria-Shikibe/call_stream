@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <memory_resource>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -17,9 +19,6 @@ import mo_yanxi.call_stream;
 namespace {
 
 using byte_allocator = std::allocator<std::byte>;
-
-template <typename... Args>
-using void_stream = mo_yanxi::basic_call_stream<byte_allocator, void, Args...>;
 
 template <typename Stream>
 concept can_emit_noop = requires(Stream& stream) {
@@ -51,27 +50,102 @@ concept can_shift_cmd_call = requires(Stream& stream, mo_yanxi::cmd_call<Fn> cal
 	stream << std::move(call);
 };
 
-struct tracking_byte_allocator {
-	using value_type = std::byte;
-
+struct tracking_allocator_state {
 	static inline std::size_t last_allocate = 0;
 	static inline std::size_t last_deallocate = 0;
+	static inline std::size_t last_value_size = 0;
+	static inline std::size_t last_value_alignment = 0;
 
 	static void reset() noexcept {
 		last_allocate = 0;
 		last_deallocate = 0;
-	}
-
-	[[nodiscard]] std::byte* allocate(std::size_t n) {
-		last_allocate = n;
-		return std::allocator<std::byte>{}.allocate(n);
-	}
-
-	void deallocate(std::byte* ptr, std::size_t n) noexcept {
-		last_deallocate = n;
-		std::allocator<std::byte>{}.deallocate(ptr, n);
+		last_value_size = 0;
+		last_value_alignment = 0;
 	}
 };
+
+template <typename T>
+struct tracking_allocator {
+	using value_type = T;
+
+	static inline std::size_t& last_allocate = tracking_allocator_state::last_allocate;
+	static inline std::size_t& last_deallocate = tracking_allocator_state::last_deallocate;
+	static inline std::size_t& last_value_size = tracking_allocator_state::last_value_size;
+	static inline std::size_t& last_value_alignment = tracking_allocator_state::last_value_alignment;
+
+	tracking_allocator() = default;
+
+	template <typename U>
+	tracking_allocator(const tracking_allocator<U>&) noexcept {
+	}
+
+	static void reset() noexcept {
+		tracking_allocator_state::reset();
+	}
+
+	[[nodiscard]] T* allocate(std::size_t n) {
+		last_allocate = n;
+		last_value_size = sizeof(T);
+		last_value_alignment = alignof(T);
+		return std::allocator<T>{}.allocate(n);
+	}
+
+	void deallocate(T* ptr, std::size_t n) noexcept {
+		last_deallocate = n;
+		last_value_size = sizeof(T);
+		last_value_alignment = alignof(T);
+		std::allocator<T>{}.deallocate(ptr, n);
+	}
+
+	template <typename U>
+	friend bool operator==(const tracking_allocator&, const tracking_allocator<U>&) noexcept {
+		return true;
+	}
+};
+
+using tracking_byte_allocator = tracking_allocator<std::byte>;
+
+template <typename T>
+struct stateful_allocator {
+	using value_type = T;
+	using propagate_on_container_move_assignment = std::false_type;
+	using propagate_on_container_swap = std::false_type;
+	using is_always_equal = std::false_type;
+
+	int id = 0;
+
+	stateful_allocator() = default;
+
+	explicit stateful_allocator(int id_in) noexcept
+		: id(id_in) {
+	}
+
+	template <typename U>
+	stateful_allocator(const stateful_allocator<U>& other) noexcept
+		: id(other.id) {
+	}
+
+	[[nodiscard]] T* allocate(std::size_t n) {
+		return std::allocator<T>{}.allocate(n);
+	}
+
+	void deallocate(T* ptr, std::size_t n) noexcept {
+		std::allocator<T>{}.deallocate(ptr, n);
+	}
+
+	template <typename U>
+	friend bool operator==(const stateful_allocator& lhs, const stateful_allocator<U>& rhs) noexcept {
+		return lhs.id == rhs.id;
+	}
+};
+
+using stateful_byte_allocator = stateful_allocator<std::byte>;
+
+template <typename... Args>
+using void_stream = mo_yanxi::basic_call_stream<byte_allocator, void, Args...>;
+
+template <typename... Args>
+using stateful_void_stream = mo_yanxi::basic_call_stream<stateful_byte_allocator, void, Args...>;
 
 struct heap_tracked_call {
 	static inline int alive = 0;
@@ -346,6 +420,46 @@ struct alignas(64) over_aligned_call {
 };
 
 static_assert(alignof(over_aligned_call) > alignof(void*));
+
+struct allocator_aware_call {
+	using allocator_type = stateful_byte_allocator;
+
+	static inline int alive = 0;
+	static inline int destroyed = 0;
+	static inline int last_allocator_id = -1;
+
+	allocator_type alloc;
+	int value{};
+	std::vector<int>* sink{};
+
+	static void reset() noexcept {
+		alive = 0;
+		destroyed = 0;
+		last_allocator_id = -1;
+	}
+
+	allocator_aware_call(std::allocator_arg_t, const allocator_type& alloc_in, int value_in, std::vector<int>* sink_in)
+		: alloc(alloc_in), value(value_in), sink(sink_in) {
+		++alive;
+		last_allocator_id = alloc.id;
+	}
+
+	allocator_aware_call(const allocator_aware_call&) = delete;
+	allocator_aware_call& operator=(const allocator_aware_call&) = delete;
+
+	~allocator_aware_call() {
+		--alive;
+		++destroyed;
+	}
+
+	void operator()() {
+		if(sink != nullptr) {
+			sink->push_back(value + alloc.id);
+		}
+	}
+};
+
+static_assert(std::uses_allocator_v<allocator_aware_call, stateful_allocator<allocator_aware_call>>);
 
 std::vector<int> sequence(int first, int last) {
 	std::vector<int> values;
@@ -747,7 +861,9 @@ TEST(CallStreamCorrectnessTest, BufferReserveKeepsAllocatorCapacity) {
 		buffer.reserve(1, [](std::byte*, std::byte*) noexcept {});
 
 		EXPECT_GE(buffer.capacity(), std::size_t{1});
-		EXPECT_EQ(buffer.capacity(), tracking_byte_allocator::last_allocate);
+		EXPECT_EQ(buffer.capacity(), tracking_byte_allocator::last_allocate * tracking_byte_allocator::last_value_size);
+		EXPECT_GE(tracking_byte_allocator::last_value_alignment, decltype(buffer)::buffer_alignment);
+		EXPECT_EQ(reinterpret_cast<std::uintptr_t>(buffer.data()) % decltype(buffer)::buffer_alignment, std::uintptr_t{0});
 	}
 
 	EXPECT_EQ(tracking_byte_allocator::last_deallocate, tracking_byte_allocator::last_allocate);
@@ -818,7 +934,7 @@ TEST(CallStreamCorrectnessTest, MergePreservesOrderAndTransfersHeapOwnership) {
 	second.emplace_back<heap_tracked_call>(3, &seen);
 	second.emplace_back<heap_tracked_call>(4, &seen);
 
-	first.merge(std::move(second));
+	first.append(std::move(second));
 
 	EXPECT_TRUE(second.empty());
 	EXPECT_EQ(heap_tracked_call::alive, 4);
@@ -851,6 +967,159 @@ TEST(CallStreamCorrectnessTest, MoveConstructionTransfersHeapOwnedCalls) {
 	moved.clear();
 	EXPECT_EQ(heap_tracked_call::alive, 0);
 	EXPECT_EQ(heap_tracked_call::destroyed, 2);
+}
+
+TEST(CallStreamCorrectnessTest, UsesAllocatorConstructionForAllocatorAwareCallables) {
+	allocator_aware_call::reset();
+	std::vector<int> seen;
+
+	{
+		stateful_void_stream<> stream(stateful_byte_allocator{40});
+		stream.emplace_back<allocator_aware_call>(2, &seen);
+
+		EXPECT_EQ(allocator_aware_call::alive, 1);
+		EXPECT_EQ(allocator_aware_call::last_allocator_id, 40);
+
+		stream.reset_and_execute();
+		EXPECT_EQ(seen, (std::vector<int>{42}));
+
+		stream.clear();
+		EXPECT_EQ(allocator_aware_call::alive, 0);
+		EXPECT_EQ(allocator_aware_call::destroyed, 1);
+	}
+
+	EXPECT_EQ(allocator_aware_call::alive, 0);
+	EXPECT_EQ(allocator_aware_call::destroyed, 1);
+}
+
+TEST(CallStreamCorrectnessTest, MergeAcceptsEqualStatefulAllocators) {
+	heap_tracked_call::reset();
+	std::vector<int> seen;
+
+	stateful_void_stream<> first(stateful_byte_allocator{7});
+	stateful_void_stream<> second(stateful_byte_allocator{7});
+
+	first.emplace_back<heap_tracked_call>(1, &seen);
+	second.emplace_back<heap_tracked_call>(2, &seen);
+
+	first.append(std::move(second));
+
+	EXPECT_TRUE(second.empty());
+	EXPECT_EQ(heap_tracked_call::alive, 2);
+
+	first.reset_and_execute();
+	EXPECT_EQ(seen, (std::vector<int>{1, 2}));
+
+	first.clear();
+	EXPECT_EQ(heap_tracked_call::alive, 0);
+	EXPECT_EQ(heap_tracked_call::destroyed, 2);
+}
+
+TEST(CallStreamCorrectnessTest, MoveAssignmentRejectsIncompatibleStatefulAllocatorsBeforeModifyingStreams) {
+	heap_tracked_call::reset();
+	std::vector<int> seen;
+
+	stateful_void_stream<> target(stateful_byte_allocator{1});
+	stateful_void_stream<> source(stateful_byte_allocator{2});
+
+	target.emplace_back<heap_tracked_call>(1, &seen);
+	source.emplace_back<heap_tracked_call>(2, &seen);
+
+	EXPECT_THROW(target = std::move(source), std::invalid_argument);
+	EXPECT_EQ(heap_tracked_call::alive, 2);
+
+	target.reset_and_execute();
+	source.reset_and_execute();
+	EXPECT_EQ(seen, (std::vector<int>{1, 2}));
+
+	target.clear();
+	source.clear();
+	EXPECT_EQ(heap_tracked_call::alive, 0);
+	EXPECT_EQ(heap_tracked_call::destroyed, 2);
+}
+
+TEST(CallStreamCorrectnessTest, MergeRejectsIncompatibleStatefulAllocatorsBeforeModifyingStreams) {
+	heap_tracked_call::reset();
+	std::vector<int> seen;
+
+	stateful_void_stream<> first(stateful_byte_allocator{1});
+	stateful_void_stream<> second(stateful_byte_allocator{2});
+
+	first.emplace_back<heap_tracked_call>(1, &seen);
+	second.emplace_back<heap_tracked_call>(2, &seen);
+
+	EXPECT_THROW(first.append(std::move(second)), std::invalid_argument);
+	EXPECT_EQ(heap_tracked_call::alive, 2);
+
+	first.reset_and_execute();
+	second.reset_and_execute();
+	EXPECT_EQ(seen, (std::vector<int>{1, 2}));
+
+	first.clear();
+	second.clear();
+	EXPECT_EQ(heap_tracked_call::alive, 0);
+	EXPECT_EQ(heap_tracked_call::destroyed, 2);
+}
+
+TEST(CallStreamCorrectnessTest, SwapRejectsIncompatibleStatefulAllocatorsBeforeModifyingStreams) {
+	heap_tracked_call::reset();
+	std::vector<int> seen;
+
+	stateful_void_stream<> first(stateful_byte_allocator{1});
+	stateful_void_stream<> second(stateful_byte_allocator{2});
+
+	first.emplace_back<heap_tracked_call>(1, &seen);
+	second.emplace_back<heap_tracked_call>(2, &seen);
+
+	EXPECT_THROW(([&] {
+		using std::swap;
+		swap(first, second);
+	}()), std::invalid_argument);
+	EXPECT_EQ(heap_tracked_call::alive, 2);
+
+	first.reset_and_execute();
+	second.reset_and_execute();
+	EXPECT_EQ(seen, (std::vector<int>{1, 2}));
+
+	first.clear();
+	second.clear();
+	EXPECT_EQ(heap_tracked_call::alive, 0);
+	EXPECT_EQ(heap_tracked_call::destroyed, 2);
+}
+
+TEST(CallStreamCorrectnessTest, PmrStreamsRequireSameMemoryResourceForResourceTransfer) {
+	heap_tracked_call::reset();
+	std::vector<int> seen;
+
+	using pmr_allocator = std::pmr::polymorphic_allocator<std::byte>;
+	using pmr_stream = mo_yanxi::call_stream<void(), pmr_allocator>;
+
+	std::pmr::monotonic_buffer_resource shared_resource;
+	pmr_stream first(pmr_allocator{&shared_resource});
+	pmr_stream second(pmr_allocator{&shared_resource});
+
+	first.emplace_back<heap_tracked_call>(1, &seen);
+	second.emplace_back<heap_tracked_call>(2, &seen);
+	first.append(std::move(second));
+	first.reset_and_execute();
+	EXPECT_EQ(seen, (std::vector<int>{1, 2}));
+	first.clear();
+
+	std::pmr::monotonic_buffer_resource left_resource;
+	std::pmr::monotonic_buffer_resource right_resource;
+	pmr_stream left(pmr_allocator{&left_resource});
+	pmr_stream right(pmr_allocator{&right_resource});
+
+	left.emplace_back<heap_tracked_call>(3, &seen);
+	right.emplace_back<heap_tracked_call>(4, &seen);
+
+	EXPECT_THROW(left.append(std::move(right)), std::invalid_argument);
+	EXPECT_EQ(heap_tracked_call::alive, 2);
+
+	left.clear();
+	right.clear();
+	EXPECT_EQ(heap_tracked_call::alive, 0);
+	EXPECT_EQ(heap_tracked_call::destroyed, 4);
 }
 
 int main(int argc, char** argv) {
