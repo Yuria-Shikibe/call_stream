@@ -82,6 +82,36 @@ CASE_PRESETS: dict[str, list[dict[str, str]]] = {
             "profile_case": "vector_result_payload",
         },
     ],
+    "construction": [
+        {
+            "name": "construct_call_stream_from_zero_trivial_1024",
+            "kind": "call_stream",
+            "signature": "void()",
+            "workload": "construction_from_zero_trivial",
+            "profile_case": "construct_call_stream_from_zero_trivial",
+        },
+        {
+            "name": "construct_vector_from_zero_trivial_1024",
+            "kind": "vector",
+            "signature": "void()",
+            "workload": "construction_from_zero_trivial",
+            "profile_case": "construct_vector_from_zero_trivial",
+        },
+        {
+            "name": "construct_call_stream_reserved_trivial_1024",
+            "kind": "call_stream",
+            "signature": "void()",
+            "workload": "construction_reserved_trivial",
+            "profile_case": "construct_call_stream_reserved_trivial",
+        },
+        {
+            "name": "construct_vector_reserved_trivial_1024",
+            "kind": "vector",
+            "signature": "void()",
+            "workload": "construction_reserved_trivial",
+            "profile_case": "construct_vector_reserved_trivial",
+        },
+    ],
 }
 
 
@@ -389,6 +419,8 @@ def write_analysis(manifest: dict[str, Any]) -> None:
     lines.append("- The `void(bench_context&)` cases are the baseline for tail-call dispatch cost.")
     lines.append("- The `uint64_t(uint64_t)` cases isolate the return-value callback/context path.")
     lines.append("- Compare `call_stream_*` rows against the matching `vector_*` rows before changing dispatch.")
+    if any(case["name"].startswith("construct_") for case in summaries):
+        lines.append("- For construction cases, `std::vector<std::move_only_function<...>>::emplace_back` is the path to inspect first when clang-cl is slower; `call_stream` should then be checked against `emit_instruction` and buffer allocation.")
     lines.append("- Use the generated per-case `hotspots.txt` and `callstacks.csv` files for source-level drill-down.")
     lines.append("")
     (RESULTS_DIR / "analysis.md").write_text("\n".join(lines), encoding="utf-8")

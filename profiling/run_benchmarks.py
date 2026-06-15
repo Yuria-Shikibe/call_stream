@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmark_results"
 CHART_PATH = RESULTS_DIR / "speedup_by_signature.png"
 POLICY_CHART_PATH = RESULTS_DIR / "noexcept_ratio_by_signature.png"
+CONSTRUCTION_CHART_PATH = RESULTS_DIR / "construction_speedup.png"
 
 DEFAULT_TOOLCHAINS = ("clang-cl", "clang", "msvc")
 TOOLCHAIN_LABELS = {
@@ -32,6 +33,19 @@ TEXT_BENCHMARK_RE = re.compile(
     r"(?P<cpu>[0-9]+(?:\.[0-9]+)?)\s+(?P<cpu_unit>ns|us|ms|s)\s+"
     r"(?P<iterations>[0-9]+)\b"
 )
+
+CONSTRUCTION_MODE_ORDER = ("from_zero", "reserved", "repeated")
+CONSTRUCTION_PAYLOAD_ORDER = ("trivial_copyable", "manual_move", "mixed")
+CONSTRUCTION_MODE_LABELS = {
+    "from_zero": "from zero",
+    "reserved": "reserved",
+    "repeated": "repeated",
+}
+CONSTRUCTION_PAYLOAD_LABELS = {
+    "trivial_copyable": "trivial",
+    "manual_move": "manual move",
+    "mixed": "mixed",
+}
 
 
 def relative_path(path: Path) -> str:
@@ -147,6 +161,16 @@ def split_benchmark_name(name: str) -> tuple[str, str, str, int] | None:
     return kind, signature, workload, int(calls)
 
 
+def split_construction_benchmark_name(name: str) -> tuple[str, str, str, int] | None:
+    match = re.fullmatch(r"construction/([^/]+)/([^/]+)/([^/]+)/([0-9]+)(?:/manual_time)?(?:_(.+))?", name)
+    if not match:
+        return None
+    container, mode, payload, calls, aggregate = match.groups()
+    if aggregate not in {None, "mean"}:
+        return None
+    return container, mode, payload, int(calls)
+
+
 def cpu_time_ns(benchmark: dict[str, Any]) -> float | None:
     value = benchmark.get("cpu_time")
     unit = benchmark.get("time_unit", "ns")
@@ -177,11 +201,26 @@ def load_benchmarks(path: Path) -> list[dict[str, Any]]:
                 "name": match.group("name"),
                 "real_time": float(match.group("real")),
                 "cpu_time": float(match.group("cpu")),
+                "real_time_unit": match.group("real_unit"),
                 "time_unit": match.group("cpu_unit"),
                 "iterations": int(match.group("iterations")),
             }
         )
     return benchmarks
+
+
+def benchmark_time_ns(benchmark: dict[str, Any], field: str) -> float | None:
+    value = benchmark.get(field)
+    unit = benchmark.get(f"{field}_unit", benchmark.get("time_unit", "ns"))
+    if not isinstance(value, (int, float)):
+        return None
+    multiplier = {
+        "ns": 1.0,
+        "us": 1_000.0,
+        "ms": 1_000_000.0,
+        "s": 1_000_000_000.0,
+    }.get(str(unit), 1.0)
+    return float(value) * multiplier
 
 
 def load_pairs(path: Path) -> dict[tuple[str, str, int], dict[str, float]]:
@@ -222,6 +261,27 @@ def load_policy_pairs(path: Path) -> dict[tuple[str, str, int], dict[str, float]
             continue
         key = (signature, workload, calls)
         slot = "noexcept" if kind == "call_stream" else "allow_exception"
+        pairs.setdefault(key, {})[slot] = ns
+    return pairs
+
+
+def load_construction_pairs(path: Path) -> dict[tuple[str, str, int], dict[str, float]]:
+    pairs: dict[tuple[str, str, int], dict[str, float]] = {}
+    for bench in load_benchmarks(path):
+        name = bench.get("name")
+        if not isinstance(name, str):
+            continue
+        parsed = split_construction_benchmark_name(name)
+        if parsed is None:
+            continue
+        container, mode, payload, calls = parsed
+        if container not in {"call_stream", "std_vector_move_only_function"}:
+            continue
+        ns = benchmark_time_ns(bench, "real_time")
+        if ns is None:
+            continue
+        key = (mode, payload, calls)
+        slot = "call_stream" if container == "call_stream" else "vector"
         pairs.setdefault(key, {})[slot] = ns
     return pairs
 
@@ -269,6 +329,73 @@ def summarize_policy(path: Path) -> dict[str, Any]:
     }
 
 
+def construction_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
+    try:
+        mode_index = CONSTRUCTION_MODE_ORDER.index(row["mode"])
+    except ValueError:
+        mode_index = len(CONSTRUCTION_MODE_ORDER)
+    try:
+        payload_index = CONSTRUCTION_PAYLOAD_ORDER.index(row["payload"])
+    except ValueError:
+        payload_index = len(CONSTRUCTION_PAYLOAD_ORDER)
+    return mode_index, payload_index, int(row["calls"])
+
+
+def summarize_construction(path: Path) -> dict[str, Any]:
+    pairs = load_construction_pairs(path)
+    rows: list[dict[str, Any]] = []
+    speedups: list[float] = []
+    by_case: dict[tuple[str, str], list[float]] = {}
+    by_mode: dict[str, list[float]] = {}
+    faster = 0
+    for key in sorted(
+        pairs,
+        key=lambda item: (
+            CONSTRUCTION_MODE_ORDER.index(item[0]) if item[0] in CONSTRUCTION_MODE_ORDER else len(CONSTRUCTION_MODE_ORDER),
+            CONSTRUCTION_PAYLOAD_ORDER.index(item[1])
+            if item[1] in CONSTRUCTION_PAYLOAD_ORDER
+            else len(CONSTRUCTION_PAYLOAD_ORDER),
+            item[2],
+        ),
+    ):
+        values = pairs[key]
+        if "call_stream" not in values or "vector" not in values:
+            continue
+        mode, payload, calls = key
+        call_ns = values["call_stream"]
+        vector_ns = values["vector"]
+        speedup = vector_ns / call_ns
+        speedups.append(speedup)
+        by_case.setdefault((mode, payload), []).append(speedup)
+        by_mode.setdefault(mode, []).append(speedup)
+        if speedup > 1.0:
+            faster += 1
+        rows.append(
+            {
+                "mode": mode,
+                "payload": payload,
+                "calls": calls,
+                "call_stream_ns": call_ns,
+                "vector_ns": vector_ns,
+                "call_stream_ns_per_call": call_ns / calls,
+                "vector_ns_per_call": vector_ns / calls,
+                "speedup": speedup,
+            }
+        )
+    return {
+        "rows": sorted(rows, key=construction_sort_key),
+        "faster": faster,
+        "total": len(rows),
+        "geomean": geomean(speedups),
+        "by_case": {case: geomean(values) for case, values in sorted(by_case.items())},
+        "by_mode": {
+            mode: geomean(by_mode[mode])
+            for mode in CONSTRUCTION_MODE_ORDER
+            if mode in by_mode
+        },
+    }
+
+
 def summarize(path: Path, toolchain: str, label: str | None = None) -> dict[str, Any]:
     pairs = load_pairs(path)
     rows: list[dict[str, Any]] = []
@@ -310,10 +437,12 @@ def summarize(path: Path, toolchain: str, label: str | None = None) -> dict[str,
         "geomean": geomean(speedups),
         "by_signature": {signature: geomean(values) for signature, values in sorted(by_signature.items())},
         "policy": summarize_policy(path),
+        "construction": summarize_construction(path),
     }
 
 
 def plot_summaries(summaries: list[dict[str, Any]], output_path: Path = CHART_PATH) -> None:
+    summaries = [summary for summary in summaries if summary["total"]]
     if not summaries:
         return
     try:
@@ -467,6 +596,94 @@ def plot_policy_summaries(summaries: list[dict[str, Any]], output_path: Path = P
     print(f"wrote {relative_path(output_path)}", flush=True)
 
 
+def plot_construction_summaries(
+    summaries: list[dict[str, Any]], output_path: Path = CONSTRUCTION_CHART_PATH
+) -> None:
+    summaries = [summary for summary in summaries if summary["construction"]["total"]]
+    if not summaries:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to generate benchmark charts; run `python -m pip install matplotlib`") from exc
+
+    cases = [
+        (mode, payload)
+        for mode in CONSTRUCTION_MODE_ORDER
+        for payload in CONSTRUCTION_PAYLOAD_ORDER
+        if any((mode, payload) in summary["construction"]["by_case"] for summary in summaries)
+    ]
+    categories = [
+        f"{CONSTRUCTION_MODE_LABELS.get(mode, mode)}\n{CONSTRUCTION_PAYLOAD_LABELS.get(payload, payload)}"
+        for mode, payload in cases
+    ]
+    x_positions = list(range(len(categories)))
+    width = min(0.28, 0.82 / max(1, len(summaries)))
+    colors = ["#2f6f9f", "#c7662e", "#3f8f5f", "#8a5f9e", "#5f6f8f"]
+
+    fig_width = max(11.0, 1.05 * len(categories) + 3.0)
+    fig, ax = plt.subplots(figsize=(fig_width, 5.8), dpi=160)
+
+    for index, summary in enumerate(summaries):
+        offset = (index - (len(summaries) - 1) / 2) * width
+        construction = summary["construction"]
+        values = [construction["by_case"].get(case, float("nan")) for case in cases]
+        bars = ax.bar(
+            [x + offset for x in x_positions],
+            values,
+            width,
+            label=summary["label"],
+            color=colors[index % len(colors)],
+            edgecolor="#1f2933",
+            linewidth=0.5,
+        )
+        for bar, value in zip(bars, values):
+            if not math.isfinite(value):
+                continue
+            label_y = value + 0.025 if value >= 1.0 else value - 0.045
+            va = "bottom" if value >= 1.0 else "top"
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                label_y,
+                f"{value:.2f}x",
+                ha="center",
+                va=va,
+                fontsize=8,
+                color="#1f2933",
+            )
+
+    all_values = [
+        value
+        for summary in summaries
+        for value in summary["construction"]["by_case"].values()
+        if math.isfinite(value)
+    ]
+    min_value = min(all_values, default=0.8)
+    max_value = max(all_values, default=1.2)
+    lower = max(0.0, min(0.75, min_value - 0.15))
+    upper = max(1.25, max_value + max(0.2, max_value * 0.08))
+
+    ax.axhline(1.0, color="#3f3f46", linewidth=1.0, linestyle="--", alpha=0.75)
+    ax.text(len(categories) - 0.55, 1.015, "1.00x parity", fontsize=8, color="#3f3f46")
+    ax.set_ylim(lower, upper)
+    ax.set_ylabel("Construction speedup vs std::vector<std::move_only_function> (x)")
+    ax.set_title("call_stream construction benchmark by build mode and payload")
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(categories)
+    ax.grid(axis="y", alpha=0.25, linewidth=0.8)
+    ax.legend(frameon=False, ncol=min(len(summaries), 4), loc="upper right")
+    ax.margins(x=0.03)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+    print(f"wrote {relative_path(output_path)}", flush=True)
+
+
 def format_ns(value: float) -> str:
     if value >= 10_000:
         return f"{value:,.0f}"
@@ -532,6 +749,11 @@ def format_markdown(summaries: list[dict[str, Any]], args: argparse.Namespace) -
         "Exception-policy ratio is `call_stream_allow_exception` CPU time divided by `call_stream` CPU time; "
         "values above 1.00x mean the `noexcept` stream is faster."
     )
+    lines.append(
+        "Construction speedup is `std::vector<std::move_only_function>` construction CPU time divided by "
+        "`call_stream` construction CPU time. The `reserved` call_stream case reserves stream byte capacity; "
+        "the `repeated` case warms each container once, clears it, then times rebuilds that reuse retained capacity."
+    )
     lines.append("")
     for summary in summaries:
         lines.append(f"## {summary['label']}")
@@ -583,6 +805,33 @@ def format_markdown(summaries: list[dict[str, Any]], args: argparse.Namespace) -
                     f"{row['ratio']:.2f}x |"
                 )
             lines.append("")
+
+        construction = summary["construction"]
+        if construction["total"]:
+            by_mode = ", ".join(
+                f"`{CONSTRUCTION_MODE_LABELS.get(mode, mode)}` {value:.2f}x"
+                for mode, value in construction["by_mode"].items()
+            )
+            lines.append(
+                f"`call_stream` is faster in {construction['faster']}/{construction['total']} construction cases; "
+                f"geomean speedup is {construction['geomean']:.2f}x. By build mode: {by_mode}."
+            )
+            lines.append("")
+            lines.append(
+                "| Build mode | Payload | Calls | call_stream CPU ns | vector CPU ns | "
+                "call_stream ns/call | vector ns/call | Speedup |"
+            )
+            lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+            for row in construction["rows"]:
+                mode_label = CONSTRUCTION_MODE_LABELS.get(row["mode"], row["mode"])
+                payload_label = CONSTRUCTION_PAYLOAD_LABELS.get(row["payload"], row["payload"])
+                lines.append(
+                    f"| `{mode_label}` | `{payload_label}` | {row['calls']} | "
+                    f"{format_ns(row['call_stream_ns'])} | {format_ns(row['vector_ns'])} | "
+                    f"{format_ns(row['call_stream_ns_per_call'])} | {format_ns(row['vector_ns_per_call'])} | "
+                    f"{row['speedup']:.2f}x |"
+                )
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -603,6 +852,7 @@ def command_run(args: argparse.Namespace) -> None:
     if args.plot:
         plot_summaries(summaries)
         plot_policy_summaries(summaries)
+        plot_construction_summaries(summaries)
 
 
 def command_summarize(args: argparse.Namespace) -> None:
@@ -618,6 +868,7 @@ def command_summarize(args: argparse.Namespace) -> None:
     if args.plot:
         plot_summaries(summaries)
         plot_policy_summaries(summaries)
+        plot_construction_summaries(summaries)
 
 
 def command_plot(args: argparse.Namespace) -> None:
@@ -629,6 +880,7 @@ def command_plot(args: argparse.Namespace) -> None:
         summaries.append(summarize(path, toolchain))
     plot_summaries(summaries)
     plot_policy_summaries(summaries)
+    plot_construction_summaries(summaries)
 
 
 def build_parser() -> argparse.ArgumentParser:

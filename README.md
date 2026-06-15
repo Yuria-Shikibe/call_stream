@@ -162,6 +162,71 @@ an unsafe MSVC musttail path.
 
 Detailed per-workload rows are in [benchmark_results/summary.md](benchmark_results/summary.md).
 
+### Construction Benchmark
+
+The construction benchmark times building equivalent `call_stream<void() noexcept>`
+and `std::vector<std::move_only_function<void()>>` sequences. Construction
+cases use Google Benchmark manual timing: each reported iteration batches 64
+container builds and records only the construct/reserve/append window. Each
+built sequence is executed after the manual timer stops so the payload writes
+must be materialized; execution, destruction, and `clear()` are excluded from
+the measured construction time.
+
+Build modes:
+
+- `from zero`: construct a fresh empty container without reserve.
+- `reserved`: construct a fresh empty container, then reserve capacity before
+  appending. `call_stream` reserves byte capacity; vector reserves element
+  capacity.
+- `repeated`: warm the container once, clear it, then time rebuilds that reuse
+  retained capacity.
+
+Payload sets:
+
+- `trivial`: non-empty trivially copyable call objects.
+- `manual move`: move-only call objects with a handwritten `noexcept` move
+  constructor.
+- `mixed`: alternating trivial and manual-move call objects.
+
+![call_stream construction benchmark speedup by build mode and payload](benchmark_results/construction_speedup.png)
+
+Current local construction run, 2026-06-15. Speedup is vector construction time
+divided by `call_stream` construction time; values above `1.00x` mean
+`call_stream` builds faster. Table values are geomeans across 64 and 1024 calls.
+
+| Build mode | Payload | clang-cl | MSVC |
+| --- | --- | ---: | ---: |
+| from zero | trivial | 11.72x | 3.18x |
+| from zero | manual move | 2.42x | 1.04x |
+| from zero | mixed | 3.04x | 1.50x |
+| reserved | trivial | 2.30x | 0.77x |
+| reserved | manual move | 0.70x | 0.14x |
+| reserved | mixed | 0.82x | 0.25x |
+| repeated | trivial | 2.26x | 0.69x |
+| repeated | manual move | 1.70x | 0.18x |
+| repeated | mixed | 1.98x | 0.39x |
+| overall | all | 2.12x | 0.58x |
+
+Construction benchmark inputs:
+
+- Raw clang-cl data: [clangcl_construction.json](benchmark_results/clangcl_construction.json), [clangcl_construction.txt](benchmark_results/clangcl_construction.txt)
+- Raw MSVC data: [msvc_construction.json](benchmark_results/msvc_construction.json), [msvc_construction.txt](benchmark_results/msvc_construction.txt)
+- Local benchmark parameters: `--benchmark_filter=construction`, `--benchmark_min_time=0.001s`, `--benchmark_repetitions=3`, aggregate mean rows
+
+The first construction draft used `PauseTiming()`/`ResumeTiming()` once per
+measured iteration to exclude validation execution. That polluted the fast
+construction cases and made clang-cl look much slower than MSVC. Verbose xmake
+builds showed matching release settings (`/MD`, `O2`, AVX/AVX2, `DNDEBUG`,
+PDBs, `/opt:ref`, `/opt:icf`), so the anomaly was not explained by missing
+clang-cl optimization flags. After switching to batched manual timing,
+`call_stream` construction is faster under clang-cl in all 18 construction
+rows. The remaining clang-cl overhead is on the vector side: VTune on
+`construct_vector_from_zero_trivial_1024` reports
+`std::vector<std::move_only_function<void()>>::emplace_back` as the dominant
+hotspot, with allocator time secondary. The matching `call_stream` profile is
+dominated by `emit_instruction`, buffer allocation, and the one-shot validation
+execution.
+
 ### Exception Policy Benchmark
 
 The benchmark binary also registers `call_stream_allow_exception/...` cases to compare the default resumable exception policy against the matching `noexcept` stream. Both sides use the same nothrow payload callables; the ratio is allow-exception CPU time divided by `noexcept` CPU time, so values above `1.00x` mean the `noexcept` policy is faster.

@@ -1,10 +1,12 @@
 #include <benchmark/benchmark.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -18,12 +20,19 @@ namespace {
 
 constexpr std::size_t kSmallCallCount = 64;
 constexpr std::size_t kLargeCallCount = 1024;
+constexpr std::size_t kConstructionBatch = 64;
 
 enum class workload {
 	stateless_short,
 	payload_short,
 	stateless_complex,
 	payload_complex,
+	mixed
+};
+
+enum class construction_payload {
+	trivial_copyable,
+	manual_move,
 	mixed
 };
 
@@ -264,6 +273,47 @@ struct result_payload_complex {
 	}
 };
 
+struct construction_trivial_call {
+	std::uint64_t value;
+
+	explicit construction_trivial_call(std::uint64_t seed) noexcept
+		: value(seed) {
+	}
+
+	void operator()() const noexcept {
+		consume_void_short(value);
+	}
+};
+
+static_assert(std::is_trivially_copyable_v<construction_trivial_call>);
+
+struct construction_manual_move_call {
+	std::uint64_t value;
+
+	explicit construction_manual_move_call(std::uint64_t seed) noexcept
+		: value(seed) {
+	}
+
+	construction_manual_move_call(const construction_manual_move_call&) = delete;
+	construction_manual_move_call& operator=(const construction_manual_move_call&) = delete;
+
+	construction_manual_move_call(construction_manual_move_call&& other) noexcept
+		: value(std::exchange(other.value, 0)) {
+	}
+
+	construction_manual_move_call& operator=(construction_manual_move_call&& other) noexcept {
+		value = std::exchange(other.value, 0);
+		return *this;
+	}
+
+	void operator()() const noexcept {
+		consume_void_short(value);
+	}
+};
+
+static_assert(!std::is_trivially_copyable_v<construction_manual_move_call>);
+static_assert(std::is_nothrow_move_constructible_v<construction_manual_move_call>);
+
 void record_items(benchmark::State& state, std::size_t calls_per_iteration) {
 	state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(calls_per_iteration));
 }
@@ -450,6 +500,234 @@ void append_result(std::vector<std::move_only_function<std::uint64_t(std::uint64
 		default: calls.emplace_back(result_payload_complex{seed_for(index)}); break;
 		}
 	}
+}
+
+template <construction_payload Payload>
+void append_construction_call(mo_yanxi::call_stream<void() noexcept>& calls, std::size_t index) {
+	if constexpr(Payload == construction_payload::trivial_copyable) {
+		calls.template emplace_back<construction_trivial_call>(seed_for(index));
+	} else if constexpr(Payload == construction_payload::manual_move) {
+		calls.template emplace_back<construction_manual_move_call>(seed_for(index));
+	} else {
+		if((index & 1U) == 0) {
+			calls.template emplace_back<construction_trivial_call>(seed_for(index));
+		} else {
+			calls.template emplace_back<construction_manual_move_call>(seed_for(index));
+		}
+	}
+}
+
+template <construction_payload Payload>
+void append_construction_call(std::vector<std::move_only_function<void()>>& calls, std::size_t index) {
+	if constexpr(Payload == construction_payload::trivial_copyable) {
+		calls.emplace_back(construction_trivial_call{seed_for(index)});
+	} else if constexpr(Payload == construction_payload::manual_move) {
+		calls.emplace_back(construction_manual_move_call{seed_for(index)});
+	} else {
+		if((index & 1U) == 0) {
+			calls.emplace_back(construction_trivial_call{seed_for(index)});
+		} else {
+			calls.emplace_back(construction_manual_move_call{seed_for(index)});
+		}
+	}
+}
+
+template <typename PayloadT>
+[[nodiscard]] std::size_t construction_stream_bytes_per_call() {
+	static const std::size_t bytes = [] {
+		mo_yanxi::call_stream<void() noexcept> calls;
+		calls.template emplace_back<PayloadT>(seed_for(0));
+		return calls.size();
+	}();
+	return bytes;
+}
+
+template <construction_payload Payload>
+[[nodiscard]] std::size_t construction_stream_reserve_bytes(std::size_t count) {
+	const auto trivial_bytes = construction_stream_bytes_per_call<construction_trivial_call>();
+	const auto manual_move_bytes = construction_stream_bytes_per_call<construction_manual_move_call>();
+	if constexpr(Payload == construction_payload::trivial_copyable) {
+		return count * trivial_bytes;
+	} else if constexpr(Payload == construction_payload::manual_move) {
+		return count * manual_move_bytes;
+	} else {
+		return ((count + 1) / 2) * trivial_bytes + (count / 2) * manual_move_bytes;
+	}
+}
+
+template <construction_payload Payload>
+void append_construction_calls(auto& calls, std::size_t count) {
+	for(std::size_t i = 0; i < count; ++i) {
+		append_construction_call<Payload>(calls, i);
+	}
+}
+
+template <construction_payload Payload>
+void reserve_construction_calls(mo_yanxi::call_stream<void() noexcept>& calls, std::size_t count) {
+	calls.reserve(construction_stream_reserve_bytes<Payload>(count));
+}
+
+template <construction_payload Payload>
+void reserve_construction_calls(std::vector<std::move_only_function<void()>>& calls, std::size_t count) {
+	calls.reserve(count);
+}
+
+void observe_construction_calls(mo_yanxi::call_stream<void() noexcept>& calls) {
+	calls.reset_and_execute();
+	observe_scalar(g_void_sink);
+}
+
+void observe_construction_calls(std::vector<std::move_only_function<void()>>& calls) {
+	for(auto& call : calls) {
+		call();
+	}
+	observe_scalar(g_void_sink);
+}
+
+template <construction_payload Payload>
+void bm_build_call_stream_from_zero(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+
+	for(auto _ : state) {
+		(void)_;
+		double elapsed = 0.0;
+		for(std::size_t batch = 0; batch < kConstructionBatch; ++batch) {
+			const auto start = std::chrono::steady_clock::now();
+			mo_yanxi::call_stream<void() noexcept> calls;
+			append_construction_calls<Payload>(calls, count);
+			benchmark::DoNotOptimize(calls);
+			benchmark::ClobberMemory();
+			const auto stop = std::chrono::steady_clock::now();
+			elapsed += std::chrono::duration<double>(stop - start).count();
+			observe_construction_calls(calls);
+		}
+		state.SetIterationTime(elapsed / static_cast<double>(kConstructionBatch));
+	}
+
+	record_items(state, count);
+}
+
+template <construction_payload Payload>
+void bm_build_vector_from_zero(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+
+	for(auto _ : state) {
+		(void)_;
+		double elapsed = 0.0;
+		for(std::size_t batch = 0; batch < kConstructionBatch; ++batch) {
+			const auto start = std::chrono::steady_clock::now();
+			std::vector<std::move_only_function<void()>> calls;
+			append_construction_calls<Payload>(calls, count);
+			benchmark::DoNotOptimize(calls);
+			benchmark::ClobberMemory();
+			const auto stop = std::chrono::steady_clock::now();
+			elapsed += std::chrono::duration<double>(stop - start).count();
+			observe_construction_calls(calls);
+		}
+		state.SetIterationTime(elapsed / static_cast<double>(kConstructionBatch));
+	}
+
+	record_items(state, count);
+}
+
+template <construction_payload Payload>
+void bm_build_call_stream_reserved(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+
+	for(auto _ : state) {
+		(void)_;
+		double elapsed = 0.0;
+		for(std::size_t batch = 0; batch < kConstructionBatch; ++batch) {
+			const auto start = std::chrono::steady_clock::now();
+			mo_yanxi::call_stream<void() noexcept> calls;
+			reserve_construction_calls<Payload>(calls, count);
+			append_construction_calls<Payload>(calls, count);
+			benchmark::DoNotOptimize(calls);
+			benchmark::ClobberMemory();
+			const auto stop = std::chrono::steady_clock::now();
+			elapsed += std::chrono::duration<double>(stop - start).count();
+			observe_construction_calls(calls);
+		}
+		state.SetIterationTime(elapsed / static_cast<double>(kConstructionBatch));
+	}
+
+	record_items(state, count);
+}
+
+template <construction_payload Payload>
+void bm_build_vector_reserved(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+
+	for(auto _ : state) {
+		(void)_;
+		double elapsed = 0.0;
+		for(std::size_t batch = 0; batch < kConstructionBatch; ++batch) {
+			const auto start = std::chrono::steady_clock::now();
+			std::vector<std::move_only_function<void()>> calls;
+			reserve_construction_calls<Payload>(calls, count);
+			append_construction_calls<Payload>(calls, count);
+			benchmark::DoNotOptimize(calls);
+			benchmark::ClobberMemory();
+			const auto stop = std::chrono::steady_clock::now();
+			elapsed += std::chrono::duration<double>(stop - start).count();
+			observe_construction_calls(calls);
+		}
+		state.SetIterationTime(elapsed / static_cast<double>(kConstructionBatch));
+	}
+
+	record_items(state, count);
+}
+
+template <construction_payload Payload>
+void bm_build_call_stream_repeated(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	mo_yanxi::call_stream<void() noexcept> calls;
+	append_construction_calls<Payload>(calls, count);
+	calls.clear();
+
+	for(auto _ : state) {
+		(void)_;
+		double elapsed = 0.0;
+		for(std::size_t batch = 0; batch < kConstructionBatch; ++batch) {
+			const auto start = std::chrono::steady_clock::now();
+			append_construction_calls<Payload>(calls, count);
+			benchmark::DoNotOptimize(calls);
+			benchmark::ClobberMemory();
+			const auto stop = std::chrono::steady_clock::now();
+			elapsed += std::chrono::duration<double>(stop - start).count();
+			observe_construction_calls(calls);
+			calls.clear();
+		}
+		state.SetIterationTime(elapsed / static_cast<double>(kConstructionBatch));
+	}
+
+	record_items(state, count);
+}
+
+template <construction_payload Payload>
+void bm_build_vector_repeated(benchmark::State& state) {
+	const auto count = static_cast<std::size_t>(state.range(0));
+	std::vector<std::move_only_function<void()>> calls;
+	append_construction_calls<Payload>(calls, count);
+	calls.clear();
+
+	for(auto _ : state) {
+		(void)_;
+		double elapsed = 0.0;
+		for(std::size_t batch = 0; batch < kConstructionBatch; ++batch) {
+			const auto start = std::chrono::steady_clock::now();
+			append_construction_calls<Payload>(calls, count);
+			benchmark::DoNotOptimize(calls);
+			benchmark::ClobberMemory();
+			const auto stop = std::chrono::steady_clock::now();
+			elapsed += std::chrono::duration<double>(stop - start).count();
+			observe_construction_calls(calls);
+			calls.clear();
+		}
+		state.SetIterationTime(elapsed / static_cast<double>(kConstructionBatch));
+	}
+
+	record_items(state, count);
 }
 
 template <typename Calls, workload Workload, typename Append>
@@ -686,11 +964,58 @@ void bm_vector_result(benchmark::State& state) {
 	REGISTER_BENCHMARK_GROUP(SUFFIX, SIGNATURE, "payload_complex", payload_complex); \
 	REGISTER_BENCHMARK_GROUP(SUFFIX, SIGNATURE, "mixed", mixed)
 
+#define REGISTER_CONSTRUCTION_GROUP(LABEL, PAYLOAD_VALUE) \
+	benchmark::RegisterBenchmark( \
+		"construction/call_stream/from_zero/" LABEL, \
+		&bm_build_call_stream_from_zero<construction_payload::PAYLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount) \
+		->UseManualTime(); \
+	benchmark::RegisterBenchmark( \
+		"construction/std_vector_move_only_function/from_zero/" LABEL, \
+		&bm_build_vector_from_zero<construction_payload::PAYLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount) \
+		->UseManualTime(); \
+	benchmark::RegisterBenchmark( \
+		"construction/call_stream/reserved/" LABEL, \
+		&bm_build_call_stream_reserved<construction_payload::PAYLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount) \
+		->UseManualTime(); \
+	benchmark::RegisterBenchmark( \
+		"construction/std_vector_move_only_function/reserved/" LABEL, \
+		&bm_build_vector_reserved<construction_payload::PAYLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount) \
+		->UseManualTime(); \
+	benchmark::RegisterBenchmark( \
+		"construction/call_stream/repeated/" LABEL, \
+		&bm_build_call_stream_repeated<construction_payload::PAYLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount) \
+		->UseManualTime(); \
+	benchmark::RegisterBenchmark( \
+		"construction/std_vector_move_only_function/repeated/" LABEL, \
+		&bm_build_vector_repeated<construction_payload::PAYLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount) \
+		->UseManualTime()
+
+void register_construction_benchmarks() {
+	REGISTER_CONSTRUCTION_GROUP("trivial_copyable", trivial_copyable);
+	REGISTER_CONSTRUCTION_GROUP("manual_move", manual_move);
+	REGISTER_CONSTRUCTION_GROUP("mixed", mixed);
+}
+
+#undef REGISTER_CONSTRUCTION_GROUP
+
 void register_benchmarks() {
 	REGISTER_WORKLOADS(void0, "void()");
 	REGISTER_WORKLOADS(context, "void(bench_context&)");
 	REGISTER_WORKLOADS(context_arg, "void(bench_context&,uint64_t)");
 	REGISTER_WORKLOADS(result, "uint64_t(uint64_t)");
+	register_construction_benchmarks();
 }
 
 #undef REGISTER_WORKLOADS
