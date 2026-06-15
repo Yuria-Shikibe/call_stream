@@ -280,22 +280,23 @@ void observe_scalar(std::uint64_t& value) {
 	benchmark::ClobberMemory();
 }
 
-template <workload Workload>
-void append_void0(mo_yanxi::call_stream<void() noexcept>& calls, std::size_t index) {
+template <workload Workload, mo_yanxi::call_stream_exception_policy ExceptionPolicy>
+void append_void0(mo_yanxi::basic_call_stream_impl<ExceptionPolicy, std::allocator<std::byte>, void>& calls,
+                  std::size_t index) {
 	if constexpr(Workload == workload::stateless_short) {
-		calls.emplace_back<void0_stateless_short>();
+		calls.template emplace_back<void0_stateless_short>();
 	} else if constexpr(Workload == workload::payload_short) {
-		calls.emplace_back<void0_payload_short>(seed_for(index));
+		calls.template emplace_back<void0_payload_short>(seed_for(index));
 	} else if constexpr(Workload == workload::stateless_complex) {
-		calls.emplace_back<void0_stateless_complex>();
+		calls.template emplace_back<void0_stateless_complex>();
 	} else if constexpr(Workload == workload::payload_complex) {
-		calls.emplace_back<void0_payload_complex>(seed_for(index));
+		calls.template emplace_back<void0_payload_complex>(seed_for(index));
 	} else {
 		switch(index & 3U) {
-		case 0: calls.emplace_back<void0_stateless_short>(); break;
-		case 1: calls.emplace_back<void0_payload_short>(seed_for(index)); break;
-		case 2: calls.emplace_back<void0_stateless_complex>(); break;
-		default: calls.emplace_back<void0_payload_complex>(seed_for(index)); break;
+		case 0: calls.template emplace_back<void0_stateless_short>(); break;
+		case 1: calls.template emplace_back<void0_payload_short>(seed_for(index)); break;
+		case 2: calls.template emplace_back<void0_stateless_complex>(); break;
+		default: calls.template emplace_back<void0_payload_complex>(seed_for(index)); break;
 		}
 	}
 }
@@ -320,22 +321,24 @@ void append_void0(std::vector<std::move_only_function<void()>>& calls, std::size
 	}
 }
 
-template <workload Workload>
-void append_context(mo_yanxi::call_stream<void(bench_context&) noexcept>& calls, std::size_t index) {
+template <workload Workload, mo_yanxi::call_stream_exception_policy ExceptionPolicy>
+void append_context(
+	mo_yanxi::basic_call_stream_impl<ExceptionPolicy, std::allocator<std::byte>, void, bench_context&>& calls,
+	std::size_t index) {
 	if constexpr(Workload == workload::stateless_short) {
-		calls.emplace_back<context_stateless_short>();
+		calls.template emplace_back<context_stateless_short>();
 	} else if constexpr(Workload == workload::payload_short) {
-		calls.emplace_back<context_payload_short>(seed_for(index));
+		calls.template emplace_back<context_payload_short>(seed_for(index));
 	} else if constexpr(Workload == workload::stateless_complex) {
-		calls.emplace_back<context_stateless_complex>();
+		calls.template emplace_back<context_stateless_complex>();
 	} else if constexpr(Workload == workload::payload_complex) {
-		calls.emplace_back<context_payload_complex>(seed_for(index));
+		calls.template emplace_back<context_payload_complex>(seed_for(index));
 	} else {
 		switch(index & 3U) {
-		case 0: calls.emplace_back<context_stateless_short>(); break;
-		case 1: calls.emplace_back<context_payload_short>(seed_for(index)); break;
-		case 2: calls.emplace_back<context_stateless_complex>(); break;
-		default: calls.emplace_back<context_payload_complex>(seed_for(index)); break;
+		case 0: calls.template emplace_back<context_stateless_short>(); break;
+		case 1: calls.template emplace_back<context_payload_short>(seed_for(index)); break;
+		case 2: calls.template emplace_back<context_stateless_complex>(); break;
+		default: calls.template emplace_back<context_payload_complex>(seed_for(index)); break;
 		}
 	}
 }
@@ -360,23 +363,28 @@ void append_context(std::vector<std::move_only_function<void(bench_context&)>>& 
 	}
 }
 
-template <workload Workload>
-void append_context_arg(mo_yanxi::call_stream<void(bench_context&, std::uint64_t) noexcept>& calls,
+template <workload Workload, mo_yanxi::call_stream_exception_policy ExceptionPolicy>
+void append_context_arg(mo_yanxi::basic_call_stream_impl<
+	                        ExceptionPolicy,
+	                        std::allocator<std::byte>,
+	                        void,
+	                        bench_context&,
+	                        std::uint64_t>& calls,
                         std::size_t index) {
 	if constexpr(Workload == workload::stateless_short) {
-		calls.emplace_back<context_arg_stateless_short>();
+		calls.template emplace_back<context_arg_stateless_short>();
 	} else if constexpr(Workload == workload::payload_short) {
-		calls.emplace_back<context_arg_payload_short>(seed_for(index));
+		calls.template emplace_back<context_arg_payload_short>(seed_for(index));
 	} else if constexpr(Workload == workload::stateless_complex) {
-		calls.emplace_back<context_arg_stateless_complex>();
+		calls.template emplace_back<context_arg_stateless_complex>();
 	} else if constexpr(Workload == workload::payload_complex) {
-		calls.emplace_back<context_arg_payload_complex>(seed_for(index));
+		calls.template emplace_back<context_arg_payload_complex>(seed_for(index));
 	} else {
 		switch(index & 3U) {
-		case 0: calls.emplace_back<context_arg_stateless_short>(); break;
-		case 1: calls.emplace_back<context_arg_payload_short>(seed_for(index)); break;
-		case 2: calls.emplace_back<context_arg_stateless_complex>(); break;
-		default: calls.emplace_back<context_arg_payload_complex>(seed_for(index)); break;
+		case 0: calls.template emplace_back<context_arg_stateless_short>(); break;
+		case 1: calls.template emplace_back<context_arg_payload_short>(seed_for(index)); break;
+		case 2: calls.template emplace_back<context_arg_stateless_complex>(); break;
+		default: calls.template emplace_back<context_arg_payload_complex>(seed_for(index)); break;
 		}
 	}
 }
@@ -402,22 +410,24 @@ void append_context_arg(std::vector<std::move_only_function<void(bench_context&,
 	}
 }
 
-template <workload Workload>
-void append_result(mo_yanxi::call_stream<std::uint64_t(std::uint64_t) noexcept>& calls, std::size_t index) {
+template <workload Workload, mo_yanxi::call_stream_exception_policy ExceptionPolicy>
+void append_result(
+	mo_yanxi::basic_call_stream_impl<ExceptionPolicy, std::allocator<std::byte>, std::uint64_t, std::uint64_t>& calls,
+	std::size_t index) {
 	if constexpr(Workload == workload::stateless_short) {
-		calls.emplace_back<result_stateless_short>();
+		calls.template emplace_back<result_stateless_short>();
 	} else if constexpr(Workload == workload::payload_short) {
-		calls.emplace_back<result_payload_short>(seed_for(index));
+		calls.template emplace_back<result_payload_short>(seed_for(index));
 	} else if constexpr(Workload == workload::stateless_complex) {
-		calls.emplace_back<result_stateless_complex>();
+		calls.template emplace_back<result_stateless_complex>();
 	} else if constexpr(Workload == workload::payload_complex) {
-		calls.emplace_back<result_payload_complex>(seed_for(index));
+		calls.template emplace_back<result_payload_complex>(seed_for(index));
 	} else {
 		switch(index & 3U) {
-		case 0: calls.emplace_back<result_stateless_short>(); break;
-		case 1: calls.emplace_back<result_payload_short>(seed_for(index)); break;
-		case 2: calls.emplace_back<result_stateless_complex>(); break;
-		default: calls.emplace_back<result_payload_complex>(seed_for(index)); break;
+		case 0: calls.template emplace_back<result_stateless_short>(); break;
+		case 1: calls.template emplace_back<result_payload_short>(seed_for(index)); break;
+		case 2: calls.template emplace_back<result_stateless_complex>(); break;
+		default: calls.template emplace_back<result_payload_complex>(seed_for(index)); break;
 		}
 	}
 }
@@ -455,21 +465,30 @@ Calls make_calls(std::size_t count, Append append) {
 	return calls;
 }
 
-template <workload Workload>
-void bm_call_stream_void0(benchmark::State& state) {
+template <typename Stream, workload Workload>
+void bm_call_stream_void0_impl(benchmark::State& state) {
 	const auto count = static_cast<std::size_t>(state.range(0));
-	auto calls = make_calls<mo_yanxi::call_stream<void() noexcept>, Workload>(
+	auto calls = make_calls<Stream, Workload>(
 		count,
 		[](auto& target, std::size_t index) { append_void0<Workload>(target, index); });
 
 	for(auto _ : state) {
 		(void)_;
-		calls.reset_ip();
-		calls.execute();
+		calls.reset_and_execute();
 		observe_scalar(g_void_sink);
 	}
 
 	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_call_stream_void0(benchmark::State& state) {
+	bm_call_stream_void0_impl<mo_yanxi::call_stream<void() noexcept>, Workload>(state);
+}
+
+template <workload Workload>
+void bm_call_stream_allow_exception_void0(benchmark::State& state) {
+	bm_call_stream_void0_impl<mo_yanxi::call_stream<void()>, Workload>(state);
 }
 
 template <workload Workload>
@@ -490,22 +509,31 @@ void bm_vector_void0(benchmark::State& state) {
 	record_items(state, count);
 }
 
-template <workload Workload>
-void bm_call_stream_context(benchmark::State& state) {
+template <typename Stream, workload Workload>
+void bm_call_stream_context_impl(benchmark::State& state) {
 	const auto count = static_cast<std::size_t>(state.range(0));
-	auto calls = make_calls<mo_yanxi::call_stream<void(bench_context&) noexcept>, Workload>(
+	auto calls = make_calls<Stream, Workload>(
 		count,
 		[](auto& target, std::size_t index) { append_context<Workload>(target, index); });
 	bench_context context;
 
 	for(auto _ : state) {
 		(void)_;
-		calls.reset_ip();
-		calls.execute(context);
+		calls.reset_and_execute(context);
 		observe_context(context);
 	}
 
 	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_call_stream_context(benchmark::State& state) {
+	bm_call_stream_context_impl<mo_yanxi::call_stream<void(bench_context&) noexcept>, Workload>(state);
+}
+
+template <workload Workload>
+void bm_call_stream_allow_exception_context(benchmark::State& state) {
+	bm_call_stream_context_impl<mo_yanxi::call_stream<void(bench_context&)>, Workload>(state);
 }
 
 template <workload Workload>
@@ -527,10 +555,10 @@ void bm_vector_context(benchmark::State& state) {
 	record_items(state, count);
 }
 
-template <workload Workload>
-void bm_call_stream_context_arg(benchmark::State& state) {
+template <typename Stream, workload Workload>
+void bm_call_stream_context_arg_impl(benchmark::State& state) {
 	const auto count = static_cast<std::size_t>(state.range(0));
-	auto calls = make_calls<mo_yanxi::call_stream<void(bench_context&, std::uint64_t) noexcept>, Workload>(
+	auto calls = make_calls<Stream, Workload>(
 		count,
 		[](auto& target, std::size_t index) { append_context_arg<Workload>(target, index); });
 	bench_context context;
@@ -538,14 +566,24 @@ void bm_call_stream_context_arg(benchmark::State& state) {
 
 	for(auto _ : state) {
 		(void)_;
-		calls.reset_ip();
-		calls.execute(context, arg);
+		calls.reset_and_execute(context, arg);
 		arg = mix(arg + context.value);
 		observe_context(context);
 		observe_scalar(arg);
 	}
 
 	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_call_stream_context_arg(benchmark::State& state) {
+	bm_call_stream_context_arg_impl<mo_yanxi::call_stream<void(bench_context&, std::uint64_t) noexcept>, Workload>(
+		state);
+}
+
+template <workload Workload>
+void bm_call_stream_allow_exception_context_arg(benchmark::State& state) {
+	bm_call_stream_context_arg_impl<mo_yanxi::call_stream<void(bench_context&, std::uint64_t)>, Workload>(state);
 }
 
 template <workload Workload>
@@ -570,10 +608,10 @@ void bm_vector_context_arg(benchmark::State& state) {
 	record_items(state, count);
 }
 
-template <workload Workload>
-void bm_call_stream_result(benchmark::State& state) {
+template <typename Stream, workload Workload>
+void bm_call_stream_result_impl(benchmark::State& state) {
 	const auto count = static_cast<std::size_t>(state.range(0));
-	auto calls = make_calls<mo_yanxi::call_stream<std::uint64_t(std::uint64_t) noexcept>, Workload>(
+	auto calls = make_calls<Stream, Workload>(
 		count,
 		[](auto& target, std::size_t index) { append_result<Workload>(target, index); });
 	std::uint64_t arg = 0x510e527fade682d1ULL;
@@ -581,8 +619,7 @@ void bm_call_stream_result(benchmark::State& state) {
 
 	for(auto _ : state) {
 		(void)_;
-		calls.reset_ip();
-		calls.execute(arg, [&result_sink](std::uint64_t result) noexcept {
+		calls.reset_and_execute(arg, [&result_sink](std::uint64_t result) noexcept {
 			result_sink += result;
 		});
 		arg = mix(arg + result_sink);
@@ -591,6 +628,16 @@ void bm_call_stream_result(benchmark::State& state) {
 	}
 
 	record_items(state, count);
+}
+
+template <workload Workload>
+void bm_call_stream_result(benchmark::State& state) {
+	bm_call_stream_result_impl<mo_yanxi::call_stream<std::uint64_t(std::uint64_t) noexcept>, Workload>(state);
+}
+
+template <workload Workload>
+void bm_call_stream_allow_exception_result(benchmark::State& state) {
+	bm_call_stream_result_impl<mo_yanxi::call_stream<std::uint64_t(std::uint64_t)>, Workload>(state);
 }
 
 template <workload Workload>
@@ -615,10 +662,15 @@ void bm_vector_result(benchmark::State& state) {
 	record_items(state, count);
 }
 
-#define REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, LABEL, WORKLOAD_VALUE) \
+#define REGISTER_BENCHMARK_GROUP(SUFFIX, SIGNATURE, LABEL, WORKLOAD_VALUE) \
 	benchmark::RegisterBenchmark( \
 		"call_stream/" SIGNATURE "/" LABEL, \
 		&bm_call_stream_##SUFFIX<workload::WORKLOAD_VALUE>) \
+		->Arg(kSmallCallCount) \
+		->Arg(kLargeCallCount); \
+	benchmark::RegisterBenchmark( \
+		"call_stream_allow_exception/" SIGNATURE "/" LABEL, \
+		&bm_call_stream_allow_exception_##SUFFIX<workload::WORKLOAD_VALUE>) \
 		->Arg(kSmallCallCount) \
 		->Arg(kLargeCallCount); \
 	benchmark::RegisterBenchmark( \
@@ -628,11 +680,11 @@ void bm_vector_result(benchmark::State& state) {
 		->Arg(kLargeCallCount)
 
 #define REGISTER_WORKLOADS(SUFFIX, SIGNATURE) \
-	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "stateless_short", stateless_short); \
-	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "payload_short", payload_short); \
-	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "stateless_complex", stateless_complex); \
-	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "payload_complex", payload_complex); \
-	REGISTER_BENCHMARK_PAIR(SUFFIX, SIGNATURE, "mixed", mixed)
+	REGISTER_BENCHMARK_GROUP(SUFFIX, SIGNATURE, "stateless_short", stateless_short); \
+	REGISTER_BENCHMARK_GROUP(SUFFIX, SIGNATURE, "payload_short", payload_short); \
+	REGISTER_BENCHMARK_GROUP(SUFFIX, SIGNATURE, "stateless_complex", stateless_complex); \
+	REGISTER_BENCHMARK_GROUP(SUFFIX, SIGNATURE, "payload_complex", payload_complex); \
+	REGISTER_BENCHMARK_GROUP(SUFFIX, SIGNATURE, "mixed", mixed)
 
 void register_benchmarks() {
 	REGISTER_WORKLOADS(void0, "void()");
@@ -642,7 +694,7 @@ void register_benchmarks() {
 }
 
 #undef REGISTER_WORKLOADS
-#undef REGISTER_BENCHMARK_PAIR
+#undef REGISTER_BENCHMARK_GROUP
 
 } // namespace
 

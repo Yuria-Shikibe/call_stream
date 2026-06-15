@@ -32,8 +32,13 @@ concept can_emplace_default = requires(Stream& stream) {
 };
 
 template <typename Stream, typename Callback>
-concept can_execute_with_callback = requires(Stream& stream, Callback callback) {
-	stream.execute(callback);
+concept can_continue_execute_with_callback = requires(Stream& stream, Callback callback) {
+	stream.continue_execute(callback);
+};
+
+template <typename Stream>
+concept can_execute_without_args = requires(Stream& stream) {
+	stream.execute();
 };
 
 template <typename Stream, typename Fn>
@@ -225,11 +230,17 @@ static_assert(can_shift_call<noexcept_void_stream, noexcept_void_call>);
 static_assert(!can_shift_call<noexcept_void_stream, throwing_void_call>);
 static_assert(can_shift_cmd_call<noexcept_void_stream, noexcept_void_call>);
 static_assert(!can_shift_cmd_call<noexcept_void_stream, throwing_void_call>);
-static_assert(can_execute_with_callback<noexcept_int_stream, noexcept_int_callback>);
-static_assert(!can_execute_with_callback<noexcept_int_stream, throwing_int_callback>);
-static_assert(noexcept(std::declval<noexcept_void_stream&>().execute()));
-static_assert(noexcept(std::declval<noexcept_int_stream&>().execute(noexcept_int_callback{})));
-static_assert(!noexcept(std::declval<mo_yanxi::call_stream<void()>&>().execute()));
+static_assert(can_continue_execute_with_callback<noexcept_int_stream, noexcept_int_callback>);
+static_assert(!can_continue_execute_with_callback<noexcept_int_stream, throwing_int_callback>);
+static_assert(!can_execute_without_args<noexcept_void_stream>);
+static_assert(noexcept(std::declval<noexcept_void_stream&>().continue_execute()));
+static_assert(noexcept(std::declval<noexcept_void_stream&>().reset_and_execute()));
+static_assert(noexcept(std::declval<noexcept_void_stream&>()()));
+static_assert(noexcept(std::declval<noexcept_int_stream&>().continue_execute(noexcept_int_callback{})));
+static_assert(noexcept(std::declval<noexcept_int_stream&>().reset_and_execute(noexcept_int_callback{})));
+static_assert(noexcept(std::declval<noexcept_int_stream&>()(noexcept_int_callback{})));
+static_assert(!noexcept(std::declval<mo_yanxi::call_stream<void()>&>().continue_execute()));
+static_assert(!noexcept(std::declval<mo_yanxi::call_stream<void()>&>().reset_and_execute()));
 static_assert(noexcept_void_stream::uses_musttail_dispatch == expected_clang_musttail_dispatch);
 static_assert(mo_yanxi::call_stream<void()>::uses_musttail_dispatch == expected_clang_musttail_dispatch);
 static_assert(!noexcept_int_stream::uses_musttail_dispatch);
@@ -355,17 +366,66 @@ TEST(CallStreamCorrectnessTest, ExecutesVoidCallsInInsertionOrder) {
 	stream << mo_yanxi::cmd_call{[&] { values.push_back(3); }};
 
 	ASSERT_FALSE(stream.empty());
+	EXPECT_TRUE(stream.is_at_start());
+	EXPECT_FALSE(stream.is_finished());
+	EXPECT_FALSE(stream.is_partially_executed());
+	EXPECT_TRUE(stream.has_pending_instructions());
 
-	stream.execute();
+	stream.reset_and_execute();
 	EXPECT_EQ(values, (std::vector<int>{1, 2, 3}));
 	EXPECT_EQ(stream.current_ip(), stream.size());
+	EXPECT_FALSE(stream.is_at_start());
+	EXPECT_TRUE(stream.is_finished());
+	EXPECT_FALSE(stream.is_partially_executed());
+	EXPECT_FALSE(stream.has_pending_instructions());
 
-	stream.execute();
+	stream.continue_execute();
 	EXPECT_EQ(values, (std::vector<int>{1, 2, 3}));
 
-	stream.reset_ip();
-	stream.execute();
+	stream.reset_and_execute();
 	EXPECT_EQ(values, (std::vector<int>{1, 2, 3, 1, 2, 3}));
+}
+
+TEST(CallStreamCorrectnessTest, IpStateQueriesReflectExecutionProgress) {
+	mo_yanxi::call_stream<void()> stream;
+
+	EXPECT_TRUE(stream.empty());
+	EXPECT_TRUE(stream.is_at_start());
+	EXPECT_TRUE(stream.is_finished());
+	EXPECT_FALSE(stream.is_partially_executed());
+	EXPECT_FALSE(stream.has_pending_instructions());
+
+	bool throw_once = true;
+	stream.emplace_back([] {});
+	stream.emplace_back([&] {
+		if(throw_once) {
+			throw_once = false;
+			throw std::runtime_error("transient");
+		}
+	});
+
+	EXPECT_TRUE(stream.is_at_start());
+	EXPECT_FALSE(stream.is_finished());
+	EXPECT_FALSE(stream.is_partially_executed());
+	EXPECT_TRUE(stream.has_pending_instructions());
+
+	EXPECT_THROW(stream.continue_execute(), std::runtime_error);
+	EXPECT_FALSE(stream.is_at_start());
+	EXPECT_FALSE(stream.is_finished());
+	EXPECT_TRUE(stream.is_partially_executed());
+	EXPECT_TRUE(stream.has_pending_instructions());
+
+	stream.continue_execute();
+	EXPECT_FALSE(stream.is_at_start());
+	EXPECT_TRUE(stream.is_finished());
+	EXPECT_FALSE(stream.is_partially_executed());
+	EXPECT_FALSE(stream.has_pending_instructions());
+
+	stream.reset_ip();
+	EXPECT_TRUE(stream.is_at_start());
+	EXPECT_FALSE(stream.is_finished());
+	EXPECT_FALSE(stream.is_partially_executed());
+	EXPECT_TRUE(stream.has_pending_instructions());
 }
 
 TEST(CallStreamCorrectnessTest, PassesArgumentsToEveryCallable) {
@@ -376,9 +436,23 @@ TEST(CallStreamCorrectnessTest, PassesArgumentsToEveryCallable) {
 
 	int value = 3;
 	const int delta = 4;
-	stream.execute(value, delta);
+	stream(value, delta);
 
 	EXPECT_EQ(value, 28);
+}
+
+TEST(CallStreamCorrectnessTest, OperatorResetExecutesResultStream) {
+	mo_yanxi::call_stream<int(int)> stream;
+	std::vector<int> results;
+
+	stream.emplace_back([](int value) { return value + 1; });
+	stream.emplace_back([](int value) { return value + 2; });
+
+	stream(3, [&](int result) { results.push_back(result); });
+	stream(4, [&](int result) { results.push_back(result); });
+
+	EXPECT_EQ(results, (std::vector<int>{4, 5, 5, 6}));
+	EXPECT_TRUE(stream.is_finished());
 }
 
 TEST(CallStreamCorrectnessTest, ByValueArgumentsAreCopiedForEachCallable) {
@@ -388,7 +462,7 @@ TEST(CallStreamCorrectnessTest, ByValueArgumentsAreCopiedForEachCallable) {
 	stream.emplace_back([&](checked_value_arg arg) { seen.push_back(arg.value); });
 	stream.emplace_back([&](checked_value_arg arg) { seen.push_back(arg.value); });
 
-	stream.execute(checked_value_arg{42});
+	stream.reset_and_execute(checked_value_arg{42});
 
 	EXPECT_EQ(seen, (std::vector<int>{42, 42}));
 }
@@ -403,7 +477,7 @@ TEST(CallStreamCorrectnessTest, OverloadedStaticCallOperatorUsesZeroPayloadDispa
 	EXPECT_EQ(overloaded_static_call::moves, 0);
 
 	std::vector<int> results;
-	stream.execute(5, [&](int result) { results.push_back(result); });
+	stream.reset_and_execute(5, [&](int result) { results.push_back(result); });
 
 	EXPECT_EQ(overloaded_static_call::calls, 1);
 	EXPECT_EQ(results, (std::vector<int>{12}));
@@ -415,7 +489,7 @@ TEST(CallStreamCorrectnessTest, EmptyNonStaticCallOperatorDoesNotUseStaticDispat
 	void_stream<> stream;
 
 	stream.emplace_back(empty_non_static_call{});
-	stream.execute();
+	stream.reset_and_execute();
 
 	EXPECT_EQ(empty_non_static_call::calls, 1);
 }
@@ -428,7 +502,7 @@ TEST(CallStreamCorrectnessTest, NoopInVoidStreamSkipsToNextInstruction) {
 	stream.emit_noop();
 	stream.emplace_back([&] { values.push_back(2); });
 
-	stream.execute();
+	stream.reset_and_execute();
 
 	EXPECT_EQ(values, (std::vector<int>{1, 2}));
 }
@@ -441,7 +515,7 @@ TEST(CallStreamCorrectnessTest, ResultCallbackReceivesAllResultsWhenItReturnsVoi
 	stream.emplace_back([](int value) { return value + 2; });
 	stream.emplace_back([](int value) { return value + 3; });
 
-	stream.execute(10, [&](int result) { results.push_back(result); });
+	stream.reset_and_execute(10, [&](int result) { results.push_back(result); });
 
 	EXPECT_EQ(results, (std::vector<int>{11, 12, 13}));
 }
@@ -454,7 +528,7 @@ TEST(CallStreamCorrectnessTest, NoopInResultStreamEmitsDefaultConstructedResult)
 	stream.emit_noop();
 	stream.emplace_back([] { return 9; });
 
-	stream.execute([&](int result) { results.push_back(result); });
+	stream.reset_and_execute([&](int result) { results.push_back(result); });
 
 	EXPECT_EQ(results, (std::vector<int>{7, 0, 9}));
 }
@@ -465,7 +539,7 @@ TEST(CallStreamCorrectnessTest, NoopInNonScalarResultStreamConstructsResultSlot)
 
 	stream.emit_noop();
 
-	stream.execute([&](std::string&& result) {
+	stream.reset_and_execute([&](std::string&& result) {
 		results.push_back(std::move(result));
 	});
 
@@ -481,7 +555,7 @@ TEST(CallStreamCorrectnessTest, ResultCallbackCanStopDispatch) {
 	stream.emplace_back([](int value) { return value + 2; });
 	stream.emplace_back([](int value) { return value + 3; });
 
-	stream.execute(10, [&](int result) {
+	stream.reset_and_execute(10, [&](int result) {
 		results.push_back(result);
 		return result == 12;
 	});
@@ -505,19 +579,43 @@ TEST(CallStreamCorrectnessTest, ResumableVoidStreamRetriesThrowingInstruction) {
 	});
 	stream.emplace_back([&] { seen.push_back(3); });
 
-	EXPECT_THROW(stream.execute(), std::runtime_error);
+	EXPECT_THROW(stream.continue_execute(), std::runtime_error);
 	EXPECT_EQ(seen, (std::vector<int>{1, 2}));
 	const std::size_t failing_ip = stream.current_ip();
 	EXPECT_GT(failing_ip, 0U);
 	EXPECT_LT(failing_ip, stream.size());
 
-	EXPECT_THROW(stream.execute(), std::runtime_error);
+	EXPECT_THROW(stream.continue_execute(), std::runtime_error);
 	EXPECT_EQ(seen, (std::vector<int>{1, 2, 2}));
 	EXPECT_EQ(stream.current_ip(), failing_ip);
 
-	stream.execute();
+	stream.continue_execute();
 	EXPECT_EQ(seen, (std::vector<int>{1, 2, 2, 2, 3}));
 	EXPECT_EQ(stream.current_ip(), stream.size());
+}
+
+TEST(CallStreamCorrectnessTest, ResetAndExecuteRestartsFromBeginningAfterPartialFailure) {
+	mo_yanxi::call_stream<void()> stream;
+	std::vector<int> seen;
+	bool throw_once = true;
+
+	stream.emplace_back([&] { seen.push_back(1); });
+	stream.emplace_back([&] {
+		seen.push_back(2);
+		if(throw_once) {
+			throw_once = false;
+			throw std::runtime_error("transient");
+		}
+	});
+	stream.emplace_back([&] { seen.push_back(3); });
+
+	EXPECT_THROW(stream.reset_and_execute(), std::runtime_error);
+	EXPECT_EQ(seen, (std::vector<int>{1, 2}));
+	EXPECT_TRUE(stream.is_partially_executed());
+
+	stream.reset_and_execute();
+	EXPECT_EQ(seen, (std::vector<int>{1, 2, 1, 2, 3}));
+	EXPECT_TRUE(stream.is_finished());
 }
 
 TEST(CallStreamCorrectnessTest, ResumableResultStreamRetriesThrowingInstruction) {
@@ -535,17 +633,17 @@ TEST(CallStreamCorrectnessTest, ResumableResultStreamRetriesThrowingInstruction)
 	});
 	stream.emplace_back([] { return 3; });
 
-	EXPECT_THROW(stream.execute([&](int result) { results.push_back(result); }), std::runtime_error);
+	EXPECT_THROW(stream.continue_execute([&](int result) { results.push_back(result); }), std::runtime_error);
 	EXPECT_EQ(results, (std::vector<int>{1}));
 	const std::size_t failing_ip = stream.current_ip();
 	EXPECT_GT(failing_ip, 0U);
 	EXPECT_LT(failing_ip, stream.size());
 
-	EXPECT_THROW(stream.execute([&](int result) { results.push_back(result); }), std::runtime_error);
+	EXPECT_THROW(stream.continue_execute([&](int result) { results.push_back(result); }), std::runtime_error);
 	EXPECT_EQ(results, (std::vector<int>{1}));
 	EXPECT_EQ(stream.current_ip(), failing_ip);
 
-	stream.execute([&](int result) { results.push_back(result); });
+	stream.continue_execute([&](int result) { results.push_back(result); });
 	EXPECT_EQ(results, (std::vector<int>{1, 2, 3}));
 	EXPECT_EQ(stream.current_ip(), stream.size());
 }
@@ -565,19 +663,19 @@ TEST(CallStreamCorrectnessTest, ResumableNonScalarResultStreamRetriesThrowingIns
 	});
 	stream.emplace_back([] { return std::string("c"); });
 
-	EXPECT_THROW(stream.execute([&](std::string&& result) { results.push_back(std::move(result)); }),
+	EXPECT_THROW(stream.continue_execute([&](std::string&& result) { results.push_back(std::move(result)); }),
 	             std::runtime_error);
 	EXPECT_EQ(results, (std::vector<std::string>{"a"}));
 	const std::size_t failing_ip = stream.current_ip();
 	EXPECT_GT(failing_ip, 0U);
 	EXPECT_LT(failing_ip, stream.size());
 
-	EXPECT_THROW(stream.execute([&](std::string&& result) { results.push_back(std::move(result)); }),
+	EXPECT_THROW(stream.continue_execute([&](std::string&& result) { results.push_back(std::move(result)); }),
 	             std::runtime_error);
 	EXPECT_EQ(results, (std::vector<std::string>{"a"}));
 	EXPECT_EQ(stream.current_ip(), failing_ip);
 
-	stream.execute([&](std::string&& result) { results.push_back(std::move(result)); });
+	stream.continue_execute([&](std::string&& result) { results.push_back(std::move(result)); });
 	EXPECT_EQ(results, (std::vector<std::string>{"a", "b", "c"}));
 	EXPECT_EQ(stream.current_ip(), stream.size());
 }
@@ -591,7 +689,7 @@ TEST(CallStreamCorrectnessTest, ResultCallbackExceptionDestroysResultAndResumesA
 	stream.emplace_back([] { return tracked_result(1); });
 	stream.emplace_back([] { return tracked_result(2); });
 
-	EXPECT_THROW(stream.execute([&](tracked_result&& result) {
+	EXPECT_THROW(stream.reset_and_execute([&](tracked_result&& result) {
 		             results.push_back(result.value);
 		             if(throw_once) {
 			             throw_once = false;
@@ -604,7 +702,7 @@ TEST(CallStreamCorrectnessTest, ResultCallbackExceptionDestroysResultAndResumesA
 	EXPECT_GT(stream.current_ip(), 0U);
 	EXPECT_LT(stream.current_ip(), stream.size());
 
-	stream.execute([&](tracked_result&& result) {
+	stream.continue_execute([&](tracked_result&& result) {
 		results.push_back(result.value);
 	});
 	EXPECT_EQ(results, (std::vector<int>{1, 2}));
@@ -619,7 +717,7 @@ TEST(CallStreamCorrectnessTest, NoexceptStreamExecutesNoexceptCalls) {
 	stream.emplace_back([&] noexcept { seen = seen * 10 + 1; });
 	stream.emplace_back([&] noexcept { seen = seen * 10 + 2; });
 
-	stream.execute();
+	stream.reset_and_execute();
 	EXPECT_EQ(seen, 12);
 	EXPECT_EQ(stream.current_ip(), stream.size());
 }
@@ -632,7 +730,7 @@ TEST(CallStreamCorrectnessTest, MoveOnlyResultsAreDestroyedAfterCallback) {
 	stream.emplace_back([](int value) { return tracked_result(value + 1); });
 	stream.emplace_back([](int value) { return tracked_result(value + 2); });
 
-	stream.execute(10, [&](tracked_result&& result) {
+	stream.reset_and_execute(10, [&](tracked_result&& result) {
 		results.push_back(result.value);
 	});
 
@@ -667,7 +765,7 @@ TEST(CallStreamCorrectnessTest, ClearDestroysHeapAllocatedCallablesExactlyOnce) 
 
 		EXPECT_EQ(heap_tracked_call::alive, 40);
 
-		stream.execute();
+		stream.reset_and_execute();
 		EXPECT_EQ(heap_tracked_call::calls, 40);
 		EXPECT_EQ(seen, sequence(1, 40));
 
@@ -676,7 +774,7 @@ TEST(CallStreamCorrectnessTest, ClearDestroysHeapAllocatedCallablesExactlyOnce) 
 		EXPECT_EQ(heap_tracked_call::alive, 0);
 		EXPECT_EQ(heap_tracked_call::destroyed, 40);
 
-		stream.execute();
+		stream.reset_and_execute();
 		EXPECT_EQ(heap_tracked_call::calls, 40);
 	}
 
@@ -696,7 +794,7 @@ TEST(CallStreamCorrectnessTest, OverAlignedCallablesUseHeapStorageAndDestroyOnce
 
 		EXPECT_EQ(over_aligned_call::alive, 8);
 
-		stream.execute();
+		stream.reset_and_execute();
 		EXPECT_EQ(seen, sequence(1, 8));
 
 		stream.clear();
@@ -725,7 +823,7 @@ TEST(CallStreamCorrectnessTest, MergePreservesOrderAndTransfersHeapOwnership) {
 	EXPECT_TRUE(second.empty());
 	EXPECT_EQ(heap_tracked_call::alive, 4);
 
-	first.execute();
+	first.reset_and_execute();
 	EXPECT_EQ(seen, (std::vector<int>{1, 2, 3, 4}));
 
 	first.clear();
@@ -747,7 +845,7 @@ TEST(CallStreamCorrectnessTest, MoveConstructionTransfersHeapOwnedCalls) {
 	EXPECT_TRUE(source.empty());
 	EXPECT_EQ(heap_tracked_call::alive, 2);
 
-	moved.execute();
+	moved.reset_and_execute();
 	EXPECT_EQ(seen, (std::vector<int>{7, 8}));
 
 	moved.clear();

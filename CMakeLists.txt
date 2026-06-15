@@ -153,6 +153,12 @@ endfunction()
 if(CALL_STREAM_HOST_PROJECT)
     enable_testing()
 
+    add_executable(call_stream.example example.cpp)
+    call_stream_configure_cxx_target(call_stream.example PRIVATE)
+    call_stream_enable_host_tuning(call_stream.example)
+    set_target_properties(call_stream.example PROPERTIES SUFFIX ".exe")
+    target_link_libraries(call_stream.example PRIVATE call_stream::call_stream)
+
     call_stream_provide_gtest()
     add_executable(call_stream.test test/call_stream_correctness_test.cpp)
     call_stream_configure_cxx_target(call_stream.test PRIVATE)

@@ -89,11 +89,11 @@ import std;
 #endif
 
 #ifndef MO_YANXI_CALL_STREAM_USE_TAIL_DISPATCH
-#define MO_YANXI_CALL_STREAM_USE_TAIL_DISPATCH 1
+#define MO_YANXI_CALL_STREAM_USE_TAIL_DISPATCH MO_YANXI_CALL_STREAM_COMPILER_CLANG
 #endif
 
 #ifndef MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH
-#define MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH 1
+#define MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH MO_YANXI_CALL_STREAM_COMPILER_CLANG
 #endif
 
 #ifndef MO_YANXI_CALL_STREAM_USE_SCALAR_RESULT_DISPATCH
@@ -1298,7 +1298,7 @@ public:
 	}
 
 
-	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute(Args... args)
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void continue_execute(Args... args)
 		noexcept(is_nothrow && std::is_nothrow_constructible_v<invoke_args, Args&&...>)
 		requires(std::is_void_v<Ret>){
 		if(empty()) return;
@@ -1315,7 +1315,7 @@ public:
 		requires(std::invocable<Callback&, Ret&&> &&
 			(ExceptionPolicy != call_stream_exception_policy::nothrow ||
 				call_stream_nothrow_result_callback_v<std::remove_reference_t<Callback>, Ret>))
-	MO_YANXI_CALL_STREAM_FORCE_INLINE void execute(Args... args, Callback&& callback)
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void continue_execute(Args... args, Callback&& callback)
 		noexcept(is_nothrow &&
 			std::is_nothrow_constructible_v<invoke_args, Args&&...> &&
 			call_stream_nothrow_result_callback_v<std::remove_reference_t<Callback>, Ret>)
@@ -1338,12 +1338,54 @@ public:
 		}
 	}
 
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void reset_and_execute(Args... args)
+		noexcept(is_nothrow && std::is_nothrow_constructible_v<invoke_args, Args&&...>)
+		requires(std::is_void_v<Ret>){
+		reset_ip();
+		this->continue_execute(std::forward<Args>(args)...);
+	}
+
+	template <typename Callback>
+		requires(std::invocable<Callback&, Ret&&> &&
+			(ExceptionPolicy != call_stream_exception_policy::nothrow ||
+				call_stream_nothrow_result_callback_v<std::remove_reference_t<Callback>, Ret>))
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void reset_and_execute(Args... args, Callback&& callback)
+		noexcept(is_nothrow &&
+			std::is_nothrow_constructible_v<invoke_args, Args&&...> &&
+			call_stream_nothrow_result_callback_v<std::remove_reference_t<Callback>, Ret>)
+		requires(!std::is_void_v<Ret>){
+		reset_ip();
+		this->continue_execute(std::forward<Args>(args)..., std::forward<Callback>(callback));
+	}
+
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void operator()(Args... args)
+		noexcept(is_nothrow && std::is_nothrow_constructible_v<invoke_args, Args&&...>)
+		requires(std::is_void_v<Ret>){
+		this->reset_and_execute(std::forward<Args>(args)...);
+	}
+
+	template <typename Callback>
+		requires(std::invocable<Callback&, Ret&&> &&
+			(ExceptionPolicy != call_stream_exception_policy::nothrow ||
+				call_stream_nothrow_result_callback_v<std::remove_reference_t<Callback>, Ret>))
+	MO_YANXI_CALL_STREAM_FORCE_INLINE void operator()(Args... args, Callback&& callback)
+		noexcept(is_nothrow &&
+			std::is_nothrow_constructible_v<invoke_args, Args&&...> &&
+			call_stream_nothrow_result_callback_v<std::remove_reference_t<Callback>, Ret>)
+		requires(!std::is_void_v<Ret>){
+		this->reset_and_execute(std::forward<Args>(args)..., std::forward<Callback>(callback));
+	}
+
 	void reset_ip(std::size_t new_ip = 0) noexcept{
 		assert(new_ip <= buffer_.size());
 		ip_ = new_ip;
 	}
 
 	[[nodiscard]] std::size_t current_ip() const noexcept{ return ip_; }
+	[[nodiscard]] bool is_at_start() const noexcept{ return ip_ == 0; }
+	[[nodiscard]] bool is_finished() const noexcept{ return ip_ == buffer_.size(); }
+	[[nodiscard]] bool is_partially_executed() const noexcept{ return ip_ > 0 && ip_ < buffer_.size(); }
+	[[nodiscard]] bool has_pending_instructions() const noexcept{ return ip_ < buffer_.size(); }
 	[[nodiscard]] bool empty() const noexcept{ return buffer_.empty(); }
 	[[nodiscard]] std::size_t size() const noexcept{ return buffer_.size(); }
 
@@ -1506,7 +1548,9 @@ void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_c
 							basic_call_stream_impl::template invoke_zero_payload_void_<PayloadT, is_static>(
 								invoke_args_ptr);
 						};
-						if(basic_call_stream_impl::has_recorded_exception_(invoke_args_ptr)) return;
+						if constexpr(has_tail_dispatch_ && !is_nothrow){
+							if(basic_call_stream_impl::has_recorded_exception_(invoke_args_ptr)) return;
+						}
 
 						return basic_call_stream_impl::tail_dispatch_after_void_payload_(
 							next_ptr, end, invoke_args_ptr);
@@ -1550,7 +1594,9 @@ void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_c
 			basic_call_stream_impl::record_current_instruction_(invoke_args_ptr, base);
 			basic_call_stream_impl::template invoke_inline_void_payload_<PayloadT, offset>(
 				base, invoke_args_ptr);
-			if(basic_call_stream_impl::has_recorded_exception_(invoke_args_ptr)) return;
+			if constexpr(has_tail_dispatch_ && !is_nothrow){
+				if(basic_call_stream_impl::has_recorded_exception_(invoke_args_ptr)) return;
+			}
 
 			return basic_call_stream_impl::tail_dispatch_after_void_payload_(next_ptr, end, invoke_args_ptr);
 		} else{
@@ -1605,7 +1651,9 @@ void basic_call_stream_impl<ExceptionPolicy, Allocator, Ret, Args...>::emplace_c
 						basic_call_stream_impl::record_current_instruction_(invoke_args_ptr, base);
 						basic_call_stream_impl::template invoke_heap_void_payload_<PayloadT, payload_offset>(
 							base, invoke_args_ptr);
-						if(basic_call_stream_impl::has_recorded_exception_(invoke_args_ptr)) return;
+						if constexpr(has_tail_dispatch_ && !is_nothrow){
+							if(basic_call_stream_impl::has_recorded_exception_(invoke_args_ptr)) return;
+						}
 
 						return basic_call_stream_impl::tail_dispatch_after_void_payload_(
 							next_ptr, end, invoke_args_ptr);

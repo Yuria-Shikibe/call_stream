@@ -8,7 +8,9 @@ It supports:
 - Zero-payload dispatch for empty call objects or compatible static `operator()`.
 - Inline storage for trivially copyable callables.
 - Inline or heap-backed lifetime management for non-trivial callables.
-- `reserve`, `clear`, `merge`, `reset_ip`, and early stop for result callbacks.
+- `reserve`, `clear`, `merge`, `reset_ip`, `continue_execute`,
+  `reset_and_execute`, `operator()`, IP state queries, and early stop for
+  result callbacks.
 - A compile-time exception policy: resumable exceptions by default, or an opt-in
   `noexcept` stream that rejects potentially throwing callables.
 
@@ -24,13 +26,18 @@ stream.emplace_back([](std::vector<int>& out) { out.push_back(1); });
 stream.emplace_back([](std::vector<int>& out) { out.push_back(2); });
 
 std::vector<int> values;
-stream.execute(values);
+stream(values); // operator() resets ip, then executes from the beginning.
 
-stream.reset_ip();
-stream.execute(values);
+stream.reset_and_execute(values);
+
+if(stream.is_finished()) {
+    stream.reset_ip();
+}
 ```
 
-For return-value streams, the last `execute` argument is the result callback. A callback returning `true` stops dispatch; a callback returning `void` consumes all results.
+For return-value streams, the last `reset_and_execute`, `continue_execute`, or
+`operator()` argument is the result callback. A callback returning `true` stops
+dispatch; a callback returning `void` consumes all results.
 
 ```cpp
 mo_yanxi::call_stream<std::uint64_t(std::uint64_t)> stream;
@@ -39,9 +46,21 @@ stream.emplace_back([](std::uint64_t x) { return x + 1; });
 stream.emplace_back([](std::uint64_t x) { return x + 2; });
 
 std::uint64_t sum = 0;
-stream.execute(10, [&](std::uint64_t result) {
+stream(10, [&](std::uint64_t result) {
     sum += result;
 });
+```
+
+`continue_execute` starts from the current instruction pointer. Use it to resume
+after a partial run, and use `reset_and_execute` or `operator()` when every call
+should run from the beginning:
+
+```cpp
+if(stream.has_pending_instructions()) {
+    stream.continue_execute(10, [&](std::uint64_t result) {
+        sum += result;
+    });
+}
 ```
 
 ## Exception Policy
@@ -49,9 +68,12 @@ stream.execute(10, [&](std::uint64_t result) {
 `call_stream<FnSign>` infers its exception policy from `FnSign`: ordinary
 function signatures use `call_stream_exception_policy::resumable`, while
 `noexcept` function signatures use `call_stream_exception_policy::nothrow`.
-If a stored callable throws during `execute`, the stream keeps `current_ip()` at
-that callable. A later `execute` resumes from the same instruction instead of
-restarting from the beginning or skipping to the end.
+If a stored callable throws during `continue_execute` or `reset_and_execute`,
+the stream keeps `current_ip()` at that callable. A later `continue_execute`
+resumes from the same instruction, while `reset_and_execute` and `operator()`
+restart from the beginning. `is_at_start()`, `is_finished()`,
+`is_partially_executed()`, and `has_pending_instructions()` expose the current
+IP state.
 
 Add `noexcept` to the function signature to require nothrow execution:
 
@@ -65,7 +87,8 @@ directly.
 
 In `nothrow` mode, `emplace_back`, `push_back`, and `operator<<` only accept
 callables that are `std::is_nothrow_invocable_r_v` for the stream signature.
-Return-value callbacks passed to `execute` must also be nothrow. This keeps the
+Return-value callbacks passed to `continue_execute`, `reset_and_execute`, or
+`operator()` must also be nothrow. This keeps the
 hot dispatch path free of exception recovery state. `nothrow` streams use
 noexcept invoker function pointers and compile-time dispatch branches. For
 `void`-returning streams, clang builds enable the musttail trampoline by
@@ -125,6 +148,30 @@ Environment:
 - Google Benchmark: v1.9.5 release
 - Build: xmake release, `fastest`, `/DNDEBUG`, `/MD`, `/std:c++latest`, AVX/AVX2 enabled
 
+### Exception Policy Benchmark
+
+The benchmark binary also registers `call_stream_allow_exception/...` cases to compare the default resumable exception policy against the matching `noexcept` stream. Both sides use the same nothrow payload callables; the ratio is allow-exception CPU time divided by `noexcept` CPU time, so values above `1.00x` mean the `noexcept` policy is faster.
+
+Run, 2026-06-15:
+
+```powershell
+python profiling\run_benchmarks.py --toolchain clang-cl --toolchain clang --toolchain msvc --min-time 0.12 --repetitions 3 --filter "call_stream(_allow_exception)?/.*" --no-plot --no-clean run
+```
+
+| Toolchain | `noexcept` faster cases | Geomean ratio | `void()` | `void(bench_context&)` | `void(bench_context&,uint64_t)` | `uint64_t(uint64_t)` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| clang-cl | 33/40 | 1.32x | 1.19x | 1.60x | 1.53x | 1.05x |
+| clang | 32/40 | 1.33x | 1.19x | 1.65x | 1.52x | 1.04x |
+| MSVC | 24/40 | 1.03x | 1.02x | 1.03x | 1.05x | 1.00x |
+
+Environment:
+
+- Date: 2026-06-15
+- CPU: Intel64 Family 6 Model 183 Stepping 1, GenuineIntel, 32 logical CPUs
+- OS: Windows 11 10.0.26200
+- Google Benchmark: v1.9.5 release
+- Build: xmake release, `fastest`, `/DNDEBUG`, `/MD`, `/std:c++latest`, AVX/AVX2 enabled
+
 ## Profiling
 
 VTune profiling is scripted separately from Google Benchmark so the sampled target contains only the selected workload loop:
@@ -142,3 +189,5 @@ Current hotspot reports are under [profiling/results](profiling/results), with t
 The strongest wins are short command streams with reference context arguments, especially under clang-cl where tail dispatch is active. Heavy workloads are often limited by the payload computation itself, so dispatch differences shrink.
 
 The latest optimization pass removed per-result state writes for trivially destructible return values and bypassed `std::invoke` for ordinary directly callable objects. That moved the clang-cl `uint64_t(uint64_t)` group from a weak path to a modest win overall, while MSVC remains close to parity.
+
+The exception-policy benchmark shows that `noexcept` mainly helps void-returning context streams on clang-cl/clang, where the geomean ratio is about `1.5x`-`1.6x` by signature. Scalar return streams are close to parity, and MSVC shows only a small overall policy difference.

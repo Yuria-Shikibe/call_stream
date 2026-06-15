@@ -171,8 +171,69 @@ def load_pairs(path: Path) -> dict[tuple[str, str, int], dict[str, float]]:
     return pairs
 
 
+def load_policy_pairs(path: Path) -> dict[tuple[str, str, int], dict[str, float]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    pairs: dict[tuple[str, str, int], dict[str, float]] = {}
+    for bench in data.get("benchmarks", []):
+        name = bench.get("name")
+        if not isinstance(name, str):
+            continue
+        parsed = split_benchmark_name(name)
+        if parsed is None:
+            continue
+        kind, signature, workload, calls = parsed
+        if kind not in {"call_stream", "call_stream_allow_exception"}:
+            continue
+        ns = cpu_time_ns(bench)
+        if ns is None:
+            continue
+        key = (signature, workload, calls)
+        slot = "noexcept" if kind == "call_stream" else "allow_exception"
+        pairs.setdefault(key, {})[slot] = ns
+    return pairs
+
+
 def geomean(values: list[float]) -> float:
     return math.exp(sum(math.log(value) for value in values) / len(values)) if values else float("nan")
+
+
+def summarize_policy(path: Path) -> dict[str, Any]:
+    pairs = load_policy_pairs(path)
+    rows: list[dict[str, Any]] = []
+    ratios: list[float] = []
+    by_signature: dict[str, list[float]] = {}
+    faster = 0
+    for key in sorted(pairs):
+        values = pairs[key]
+        if "noexcept" not in values or "allow_exception" not in values:
+            continue
+        signature, workload, calls = key
+        noexcept_ns = values["noexcept"]
+        allow_exception_ns = values["allow_exception"]
+        ratio = allow_exception_ns / noexcept_ns
+        ratios.append(ratio)
+        by_signature.setdefault(signature, []).append(ratio)
+        if ratio > 1.0:
+            faster += 1
+        rows.append(
+            {
+                "signature": signature,
+                "workload": workload,
+                "calls": calls,
+                "noexcept_ns": noexcept_ns,
+                "allow_exception_ns": allow_exception_ns,
+                "noexcept_ns_per_call": noexcept_ns / calls,
+                "allow_exception_ns_per_call": allow_exception_ns / calls,
+                "ratio": ratio,
+            }
+        )
+    return {
+        "rows": rows,
+        "faster": faster,
+        "total": len(rows),
+        "geomean": geomean(ratios),
+        "by_signature": {signature: geomean(values) for signature, values in sorted(by_signature.items())},
+    }
 
 
 def summarize(path: Path, toolchain: str) -> dict[str, Any]:
@@ -215,6 +276,7 @@ def summarize(path: Path, toolchain: str) -> dict[str, Any]:
         "total": len(rows),
         "geomean": geomean(speedups),
         "by_signature": {signature: geomean(values) for signature, values in sorted(by_signature.items())},
+        "policy": summarize_policy(path),
     }
 
 
@@ -320,29 +382,59 @@ def format_markdown(summaries: list[dict[str, Any]], args: argparse.Namespace) -
         lines.append(f"- benchmark_filter: `{args.filter}`")
     lines.append("")
     lines.append("Speedup is `std::vector<std::move_only_function>` CPU time divided by `call_stream` CPU time.")
+    lines.append(
+        "Exception-policy ratio is `call_stream_allow_exception` CPU time divided by `call_stream` CPU time; "
+        "values above 1.00x mean the `noexcept` stream is faster."
+    )
     lines.append("")
     for summary in summaries:
         lines.append(f"## {summary['label']}")
         lines.append("")
-        by_sig = ", ".join(f"`{sig}` {value:.2f}x" for sig, value in summary["by_signature"].items())
-        lines.append(
-            f"`call_stream` is faster in {summary['faster']}/{summary['total']} cases; "
-            f"geomean speedup is {summary['geomean']:.2f}x. By signature: {by_sig}."
-        )
-        lines.append("")
         lines.append(f"- JSON: [{summary['json']}](../{summary['json']})")
         lines.append(f"- Text: [{summary['txt']}](../{summary['txt']})")
         lines.append("")
-        lines.append("| Signature | Workload | Calls | call_stream CPU ns | vector CPU ns | call_stream ns/call | vector ns/call | Speedup |")
-        lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
-        for row in summary["rows"]:
+        if summary["total"]:
+            by_sig = ", ".join(f"`{sig}` {value:.2f}x" for sig, value in summary["by_signature"].items())
             lines.append(
-                f"| `{row['signature']}` | `{row['workload']}` | {row['calls']} | "
-                f"{format_ns(row['call_stream_ns'])} | {format_ns(row['vector_ns'])} | "
-                f"{format_ns(row['call_stream_ns_per_call'])} | {format_ns(row['vector_ns_per_call'])} | "
-                f"{row['speedup']:.2f}x |"
+                f"`call_stream` is faster in {summary['faster']}/{summary['total']} vector cases; "
+                f"geomean speedup is {summary['geomean']:.2f}x. By signature: {by_sig}."
             )
-        lines.append("")
+            lines.append("")
+            lines.append(
+                "| Signature | Workload | Calls | call_stream CPU ns | vector CPU ns | "
+                "call_stream ns/call | vector ns/call | Speedup |"
+            )
+            lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+            for row in summary["rows"]:
+                lines.append(
+                    f"| `{row['signature']}` | `{row['workload']}` | {row['calls']} | "
+                    f"{format_ns(row['call_stream_ns'])} | {format_ns(row['vector_ns'])} | "
+                    f"{format_ns(row['call_stream_ns_per_call'])} | {format_ns(row['vector_ns_per_call'])} | "
+                    f"{row['speedup']:.2f}x |"
+                )
+            lines.append("")
+
+        policy = summary["policy"]
+        if policy["total"]:
+            by_sig = ", ".join(f"`{sig}` {value:.2f}x" for sig, value in policy["by_signature"].items())
+            lines.append(
+                f"`noexcept` is faster than allow-exception in {policy['faster']}/{policy['total']} cases; "
+                f"geomean ratio is {policy['geomean']:.2f}x. By signature: {by_sig}."
+            )
+            lines.append("")
+            lines.append(
+                "| Signature | Workload | Calls | noexcept CPU ns | allow-exception CPU ns | "
+                "noexcept ns/call | allow-exception ns/call | Ratio |"
+            )
+            lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+            for row in policy["rows"]:
+                lines.append(
+                    f"| `{row['signature']}` | `{row['workload']}` | {row['calls']} | "
+                    f"{format_ns(row['noexcept_ns'])} | {format_ns(row['allow_exception_ns'])} | "
+                    f"{format_ns(row['noexcept_ns_per_call'])} | {format_ns(row['allow_exception_ns_per_call'])} | "
+                    f"{row['ratio']:.2f}x |"
+                )
+            lines.append("")
     return "\n".join(lines)
 
 
