@@ -143,7 +143,7 @@ Final run, 2026-05-30:
 Environment:
 
 - Date: 2026-05-30
-- CPU: 13th Gen Intel(R) Core(TM) i9-13900HX, 24 cores / 32 threads
+- CPU: 13th Gen Intel® Core™ i9-13900HX, 24 cores / 32 threads
 - OS: Windows 11
 - Google Benchmark: v1.9.5 release
 - Build: xmake release, `fastest`, `/DNDEBUG`, `/MD`, `/std:c++latest`, AVX/AVX2 enabled
