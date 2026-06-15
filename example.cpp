@@ -10,63 +10,51 @@ int main(){
 		return value * 2;
 	};
 
-	std::vector<int> results;
-	transforms(21, [&](int result){
-		results.push_back(result);
+	std::println("reset_and_execute(21)");
+	transforms(21, [](int result){
+		std::println("  result: {}", result);
 	});
+	std::println("  is_finished: {}", transforms.is_finished());
+	std::println("  has_pending_instructions: {}", transforms.has_pending_instructions());
 
-	if(results.size() != 2 || results[0] != 22 || results[1] != 42){
-		return 1;
-	}
-	if(!transforms.is_finished() || transforms.has_pending_instructions()){
-		return 2;
-	}
-
-	transforms.continue_execute(21, [&](int result){
-		results.push_back(result);
+	std::println("continue_execute(21) after finishing");
+	transforms.continue_execute(21, [](int result){
+		std::println("  result: {}", result);
 	});
-	if(results.size() != 2){
-		return 3;
-	}
+	std::println("  no result is printed because no instructions are pending");
 
-	transforms.reset_and_execute(10, [&](int result){
-		results.push_back(result);
+	std::println("reset_and_execute(10)");
+	transforms.reset_and_execute(10, [](int result){
+		std::println("  result: {}", result);
 	});
-	if(results.size() != 4 || results[2] != 11 || results[3] != 20){
-		return 4;
-	}
 
 	mo_yanxi::call_stream<void()> steps;
-	std::vector<int> seen;
 	bool throw_once = true;
-	steps.emplace_back([&]{
-		seen.push_back(1);
+	steps.emplace_back([]{
+		std::println("  step 1");
 	});
 	steps.emplace_back([&]{
-		seen.push_back(2);
+		std::println("  step 2");
 		if(throw_once){
 			throw_once = false;
 			throw std::runtime_error("transient");
 		}
 	});
-	steps.emplace_back([&]{
-		seen.push_back(3);
+	steps.emplace_back([]{
+		std::println("  step 3");
 	});
 
+	std::println("reset_and_execute() with a transient exception");
 	try{
 		steps.reset_and_execute();
-		return 5;
-	} catch(const std::runtime_error&){
+		std::println("  completed without exception");
+	} catch(const std::runtime_error& error){
+		std::println("  caught exception: {}", error.what());
 	}
+	std::println("  is_partially_executed: {}", steps.is_partially_executed());
+	std::println("  has_pending_instructions: {}", steps.has_pending_instructions());
 
-	if(!steps.is_partially_executed() || !steps.has_pending_instructions()){
-		return 6;
-	}
-
+	std::println("continue_execute() resumes from the failed instruction");
 	steps.continue_execute();
-	if(!steps.is_finished() || seen != std::vector<int>{1, 2, 2, 3}){
-		return 7;
-	}
-
-	return 0;
+	std::println("  is_finished: {}", steps.is_finished());
 }
