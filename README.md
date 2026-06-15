@@ -46,30 +46,35 @@ stream.execute(10, [&](std::uint64_t result) {
 
 ## Exception Policy
 
-`call_stream<FnSign>` uses `call_stream_exception_policy::resumable` by default.
+`call_stream<FnSign>` infers its exception policy from `FnSign`: ordinary
+function signatures use `call_stream_exception_policy::resumable`, while
+`noexcept` function signatures use `call_stream_exception_policy::nothrow`.
 If a stored callable throws during `execute`, the stream keeps `current_ip()` at
 that callable. A later `execute` resumes from the same instruction instead of
 restarting from the beginning or skipping to the end.
 
-Use `noexcept_call_stream<FnSign>` or the third `call_stream` template argument
-to require nothrow execution:
+Add `noexcept` to the function signature to require nothrow execution:
 
 ```cpp
-mo_yanxi::noexcept_call_stream<void()> stream;
-// Equivalent:
-mo_yanxi::call_stream<
-    void(),
-    std::allocator<std::byte>,
-    mo_yanxi::call_stream_exception_policy::nothrow> stream2;
+mo_yanxi::call_stream<void() noexcept> stream;
 ```
+
+`noexcept_call_stream<FnSign>` and the explicit third `call_stream` template
+argument remain available when an existing call site wants to spell the policy
+directly.
 
 In `nothrow` mode, `emplace_back`, `push_back`, and `operator<<` only accept
 callables that are `std::is_nothrow_invocable_r_v` for the stream signature.
 Return-value callbacks passed to `execute` must also be nothrow. This keeps the
 hot dispatch path free of exception recovery state. `nothrow` streams use
-noexcept invoker function pointers and compile-time dispatch branches; tail
-dispatch can be enabled with `MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH`
-on compiler/configuration combinations that accept the musttail trampoline.
+noexcept invoker function pointers and compile-time dispatch branches. For
+`void`-returning streams, clang builds enable the musttail trampoline by
+default when `[[clang::musttail]]` is available, including resumable streams
+whose callables may throw. Resumable tail dispatch records the current
+instruction in shared dispatch state before each payload call, so exceptions
+still resume at the failing instruction. Define
+`MO_YANXI_CALL_STREAM_USE_NOEXCEPT_TAIL_DISPATCH=0` to force loop dispatch for
+that path.
 
 ## Build And Test
 

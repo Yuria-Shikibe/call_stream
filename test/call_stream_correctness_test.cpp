@@ -10,6 +10,10 @@
 
 import mo_yanxi.call_stream;
 
+#ifndef __has_cpp_attribute
+#define __has_cpp_attribute(attr) 0
+#endif
+
 namespace {
 
 using byte_allocator = std::allocator<std::byte>;
@@ -204,8 +208,14 @@ struct throwing_int_callback {
 	}
 };
 
-using noexcept_void_stream = mo_yanxi::noexcept_call_stream<void(), byte_allocator>;
-using noexcept_int_stream = mo_yanxi::noexcept_call_stream<int(), byte_allocator>;
+using noexcept_void_stream = mo_yanxi::call_stream<void() noexcept, byte_allocator>;
+using noexcept_int_stream = mo_yanxi::call_stream<int() noexcept, byte_allocator>;
+
+#if defined(__clang__) && __has_cpp_attribute(clang::musttail)
+inline constexpr bool expected_clang_musttail_dispatch = true;
+#else
+inline constexpr bool expected_clang_musttail_dispatch = false;
+#endif
 
 static_assert(can_emplace_default<noexcept_void_stream, noexcept_void_call>);
 static_assert(!can_emplace_default<noexcept_void_stream, throwing_void_call>);
@@ -220,6 +230,10 @@ static_assert(!can_execute_with_callback<noexcept_int_stream, throwing_int_callb
 static_assert(noexcept(std::declval<noexcept_void_stream&>().execute()));
 static_assert(noexcept(std::declval<noexcept_int_stream&>().execute(noexcept_int_callback{})));
 static_assert(!noexcept(std::declval<mo_yanxi::call_stream<void()>&>().execute()));
+static_assert(noexcept_void_stream::uses_musttail_dispatch == expected_clang_musttail_dispatch);
+static_assert(mo_yanxi::call_stream<void()>::uses_musttail_dispatch == expected_clang_musttail_dispatch);
+static_assert(!noexcept_int_stream::uses_musttail_dispatch);
+static_assert(noexcept_void_stream::exception_policy == mo_yanxi::call_stream_exception_policy::nothrow);
 
 struct tracked_result {
 	static inline int alive = 0;
@@ -599,7 +613,7 @@ TEST(CallStreamCorrectnessTest, ResultCallbackExceptionDestroysResultAndResumesA
 }
 
 TEST(CallStreamCorrectnessTest, NoexceptStreamExecutesNoexceptCalls) {
-	mo_yanxi::noexcept_call_stream<void()> stream;
+	mo_yanxi::call_stream<void() noexcept> stream;
 	int seen = 0;
 
 	stream.emplace_back([&] noexcept { seen = seen * 10 + 1; });

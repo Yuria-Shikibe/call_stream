@@ -281,7 +281,7 @@ void observe_scalar(std::uint64_t& value) {
 }
 
 template <workload Workload>
-void append_void0(mo_yanxi::call_stream<void()>& calls, std::size_t index) {
+void append_void0(mo_yanxi::call_stream<void() noexcept>& calls, std::size_t index) {
 	if constexpr(Workload == workload::stateless_short) {
 		calls.emplace_back<void0_stateless_short>();
 	} else if constexpr(Workload == workload::payload_short) {
@@ -321,7 +321,7 @@ void append_void0(std::vector<std::move_only_function<void()>>& calls, std::size
 }
 
 template <workload Workload>
-void append_context(mo_yanxi::call_stream<void(bench_context&)>& calls, std::size_t index) {
+void append_context(mo_yanxi::call_stream<void(bench_context&) noexcept>& calls, std::size_t index) {
 	if constexpr(Workload == workload::stateless_short) {
 		calls.emplace_back<context_stateless_short>();
 	} else if constexpr(Workload == workload::payload_short) {
@@ -361,7 +361,8 @@ void append_context(std::vector<std::move_only_function<void(bench_context&)>>& 
 }
 
 template <workload Workload>
-void append_context_arg(mo_yanxi::call_stream<void(bench_context&, std::uint64_t)>& calls, std::size_t index) {
+void append_context_arg(mo_yanxi::call_stream<void(bench_context&, std::uint64_t) noexcept>& calls,
+                        std::size_t index) {
 	if constexpr(Workload == workload::stateless_short) {
 		calls.emplace_back<context_arg_stateless_short>();
 	} else if constexpr(Workload == workload::payload_short) {
@@ -402,7 +403,7 @@ void append_context_arg(std::vector<std::move_only_function<void(bench_context&,
 }
 
 template <workload Workload>
-void append_result(mo_yanxi::call_stream<std::uint64_t(std::uint64_t)>& calls, std::size_t index) {
+void append_result(mo_yanxi::call_stream<std::uint64_t(std::uint64_t) noexcept>& calls, std::size_t index) {
 	if constexpr(Workload == workload::stateless_short) {
 		calls.emplace_back<result_stateless_short>();
 	} else if constexpr(Workload == workload::payload_short) {
@@ -457,7 +458,7 @@ Calls make_calls(std::size_t count, Append append) {
 template <workload Workload>
 void bm_call_stream_void0(benchmark::State& state) {
 	const auto count = static_cast<std::size_t>(state.range(0));
-	auto calls = make_calls<mo_yanxi::call_stream<void()>, Workload>(
+	auto calls = make_calls<mo_yanxi::call_stream<void() noexcept>, Workload>(
 		count,
 		[](auto& target, std::size_t index) { append_void0<Workload>(target, index); });
 
@@ -492,7 +493,7 @@ void bm_vector_void0(benchmark::State& state) {
 template <workload Workload>
 void bm_call_stream_context(benchmark::State& state) {
 	const auto count = static_cast<std::size_t>(state.range(0));
-	auto calls = make_calls<mo_yanxi::call_stream<void(bench_context&)>, Workload>(
+	auto calls = make_calls<mo_yanxi::call_stream<void(bench_context&) noexcept>, Workload>(
 		count,
 		[](auto& target, std::size_t index) { append_context<Workload>(target, index); });
 	bench_context context;
@@ -529,7 +530,7 @@ void bm_vector_context(benchmark::State& state) {
 template <workload Workload>
 void bm_call_stream_context_arg(benchmark::State& state) {
 	const auto count = static_cast<std::size_t>(state.range(0));
-	auto calls = make_calls<mo_yanxi::call_stream<void(bench_context&, std::uint64_t)>, Workload>(
+	auto calls = make_calls<mo_yanxi::call_stream<void(bench_context&, std::uint64_t) noexcept>, Workload>(
 		count,
 		[](auto& target, std::size_t index) { append_context_arg<Workload>(target, index); });
 	bench_context context;
@@ -572,7 +573,7 @@ void bm_vector_context_arg(benchmark::State& state) {
 template <workload Workload>
 void bm_call_stream_result(benchmark::State& state) {
 	const auto count = static_cast<std::size_t>(state.range(0));
-	auto calls = make_calls<mo_yanxi::call_stream<std::uint64_t(std::uint64_t)>, Workload>(
+	auto calls = make_calls<mo_yanxi::call_stream<std::uint64_t(std::uint64_t) noexcept>, Workload>(
 		count,
 		[](auto& target, std::size_t index) { append_result<Workload>(target, index); });
 	std::uint64_t arg = 0x510e527fade682d1ULL;
